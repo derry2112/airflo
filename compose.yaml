@@ -1,0 +1,94 @@
+services:
+  airflow:
+    # Konfigurasi lama Airflow 3 dipertahankan sebagai komentar.
+    # image: apache/airflow:3.1.7-python3.12
+    # Keterangan: kode QR Recon memakai API dan context Airflow 2.
+    image: apache/airflow:2.10.5-python3.12
+    container_name: airflow-web
+    command: standalone
+    environment:
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      # Keterangan: diperlukan oleh Connection4WAY.py untuk OracleHook.
+      # Versi yang tidak tersedia dipertahankan sebagai catatan:
+      # _PIP_ADDITIONAL_REQUIREMENTS: "apache-airflow-providers-oracle==3.13.2"
+      _PIP_ADDITIONAL_REQUIREMENTS: "apache-airflow-providers-oracle==3.12.1"
+      AIRFLOW_CONN_FTP_EBSP: "ftp://airflow:airflow@ftp:21"
+      AIRFLOW_CONN_FTP_MII: "ftp://airflow:airflow@ftp:21"
+      # Keterangan: dipakai SFTPHook pada proses QR Recon untuk pengiriman ke PWC.
+      AIRFLOW_CONN_SFTP_PWC_POST: "sftp://airflow:airflow@sftp-pwc:22"
+      PYTHONPATH: "/opt/airflow/runtime"
+    ports:
+      - "8080:8080"
+    volumes:
+      # Volume Airflow 3 lama tidak dihapus.
+      # - airflow-data:/opt/airflow
+      - airflow2-data:/opt/airflow
+      - ./dags:/opt/airflow/dags:ro
+      - ./data:/opt/airflow/project-data
+      - ./dags:/data/airflow/nfs/dags:ro
+      - ./data/artifacts:/data/airflow/nfs/artifacts
+      - ./data/pmcard:/pmcard
+      - ./airflow_runtime:/opt/airflow/runtime:ro
+    depends_on:
+      - ftp
+      - sftp-pwc
+    healthcheck:
+      # Healthcheck Airflow 3 lama:
+      # test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/monitor/health"]
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+
+  ftp:
+    image: fauria/vsftpd
+    container_name: airflow-ftp
+    environment:
+      FTP_USER: airflow
+      FTP_PASS: airflow
+      PASV_ADDRESS: ftp
+      PASV_ADDR_RESOLVE: "YES"
+      PASV_MIN_PORT: 21100
+      PASV_MAX_PORT: 21110
+    volumes:
+      - ./data/ACQ_MTI:/home/vsftpd/airflow/ACQ/MII:ro
+      - ./data/ftp-destination/sftpdata:/home/vsftpd/airflow/sftpdata
+
+  sftp-pwc:
+    image: atmoz/sftp:alpine
+    container_name: airflow-sftp-pwc
+    # Konfigurasi lama dipertahankan; UID 1001 tidak dapat menulis bind mount lokal.
+    # command: airflow:airflow:1001
+    # Keterangan: UID 1000 disamakan dengan pemilik data/sftp-pwc di host.
+    command: airflow:airflow:1000
+    volumes:
+      # Keterangan: lokasi penyimpanan file hasil kirim SFTP PWC di lingkungan lokal.
+      - ./data/sftp-pwc:/home/airflow/upload
+      # Keterangan: user SFTP berada dalam chroot /home/airflow, sehingga target
+      # /pwrcard/home/usr/data dipasang di bawah home user agar terlihat via SFTP.
+      - ./data/pwrcard:/home/airflow/pwrcard
+
+  oracle:
+    image: gvenzl/oracle-free:23-slim
+    container_name: airflow-oracle
+    environment:
+      ORACLE_PASSWORD: oracle
+      APP_USER: POWERCARD
+      APP_USER_PASSWORD: powercard
+    ports:
+      - "1521:1521"
+    volumes:
+      - oracle-data:/opt/oracle/oradata
+      - ./oracle/init:/container-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "healthcheck.sh"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+
+volumes:
+  airflow-data:
+  airflow2-data:
+  oracle-data:

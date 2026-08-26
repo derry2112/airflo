@@ -1,0 +1,3 @@
+# Tambahkan provider atau library Python khusus DAG di sini.
+# Contoh: apache-airflow-providers-postgres==6.5.0
+
