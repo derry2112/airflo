@@ -466,6 +466,11 @@ class SplitClass():
             record_pwc = 0
             hd = None
             generated_posting_files = []
+            # Keterangan: kumpulkan seluruh record PWC lebih dahulu supaya satu
+            # source file menghasilkan satu POSTFLIN dan dapat dikelompokkan per
+            # merchant/batch sesuai susunan HR-HS-(DT/OA)-TS-TR.
+            pwc_posting_records = []
+            posting_filename = None
 
             for line in file_unprocessed:
                 logging.info('Line: %s', line)
@@ -508,18 +513,21 @@ class SplitClass():
                         # Keterangan: gunakan underscore sebagai pemisah POSTFLIN
                         # dan timestamp agar nama lokal serta remote menjadi seragam.
                         # Kode lama: filename = f"POSTFLIN.{filename_datetime}.txt"
-                        filename = f"POSTFLIN_{filename_datetime}.txt"
+                        # Kode lama: filename = f"POSTFLIN_{filename_datetime}.txt"
+                        if posting_filename is None:
+                            posting_filename = f"POSTFLIN_{filename_datetime}.txt"
+                        filename = posting_filename
 
                         logging.info('[QR_RECON] Calling create_posting_file | filename:%s | mpan:%s | mid:%s | target_split:%s ', filename,mpan,mid,str_result_pwc)
 
-                        generated_posting_file = self.create_posting_file(
-                            filename,
-                            rec,
-                            mid,
-                            target_split=str_result_pwc,
-                        )
-                        if generated_posting_file not in generated_posting_files:
-                            generated_posting_files.append(generated_posting_file)
+                        # Kode lama membuat/menulis file pada setiap DH sehingga
+                        # transaksi dapat terpecah ketika detik timestamp berubah:
+                        # generated_posting_file = self.create_posting_file(
+                        #     filename, rec, mid, target_split=str_result_pwc,
+                        # )
+                        # if generated_posting_file not in generated_posting_files:
+                        #     generated_posting_files.append(generated_posting_file)
+                        pwc_posting_records.append((rec, mid))
                         file_processed_PWC.write(rec.to_line() + "\n")
                         row_count_pwc += 1
                         # record_pwc += int(rec.dispute_amount)
@@ -537,6 +545,14 @@ class SplitClass():
 
                     file_processed.write(line[:28] + str(row_count)+'|'+str(record))
                     file_processed_PWC.write(hd.to_header_line()+'|'+str(record_pwc))
+                    if pwc_posting_records:
+                        generated_posting_file = self.create_posting_batch_file(
+                            posting_filename,
+                            pwc_posting_records,
+                            target_split=str_result_pwc,
+                            header=hd,
+                        )
+                        generated_posting_files.append(generated_posting_file)
                     logging.info('==========SPLIT PROCESSED END QR RECO ==========')
             return generated_posting_files
         except Exception:
@@ -611,7 +627,8 @@ class SplitClass():
             logging.info('filename:%s', filename)
             logging.info('filename type: %s', type(filename))
             logging.info('mid:%s', mid)
-            logging.info('rec.to_line', rec.to_line())
+            # Kode lama: logging.info('rec.to_line', rec.to_line())
+            logging.info('rec.to_line: %s', rec.to_line())
             if not isinstance(filename, str) or not filename.endswith(".txt"):
                 raise ValueError(f"Filename must be string type and .txt extention. Got: {filename!r}, type:{type(filename)}")
 
@@ -622,23 +639,51 @@ class SplitClass():
             full_path = os.path.join(os.path.dirname(target_split),filename)
 
             header_record = self.generate_hr_record()
-            trailer_record = self.generate_tr_record()
+
+            # Keterangan: sequence file tidak boleh selalu kembali ke 00000001.
+            # Ambil jumlah record yang sudah ada (tanpa TR) agar record berikutnya
+            # mendapat sequence yang berurutan dan voucher DT sama dengan OA.
+            existing_lines = []
+            if os.path.isfile(full_path):
+                with open(full_path, "r", encoding="utf-8") as existing_file:
+                    existing_lines = existing_file.read().splitlines()
+                existing_lines = [line for line in existing_lines if not line.startswith("TR")]
+            next_sequence = len(existing_lines) + 1 if existing_lines else 2
+            transaction_sequence = sum(1 for line in existing_lines if line.startswith("DT")) + 1
 
             logging.info('full path:%s', full_path)
             logging.info('header_record:%s',header_record)
-            logging.info('trailer_record:%s',trailer_record)
+            # Kode lama berada sebelum trailer_record dibuat dan dapat memicu
+            # NameError: logging.info('trailer_record:%s', trailer_record)
 
             # Keterangan: normalisasi MID satu kali agar nilai yang sama digunakan
             # secara konsisten oleh generator HS dan TS.
             mid = str(mid).strip()
 
             # Kode lama: merchant_header_record = self.generate_hs_record(rec, str(mid).strip())
-            merchant_header_record = self.generate_hs_record(rec, mid) # HS
-            transaction_record = self.generate_dt_record(rec) # DT
+            # Kode lama: merchant_header_record = self.generate_hs_record(rec, mid)
+            merchant_header_record = self.generate_hs_record(rec, mid, next_sequence) # HS
+            # Kode lama: transaction_record = self.generate_dt_record(rec)
+            transaction_record = self.generate_dt_record(rec, next_sequence + 1, transaction_sequence) # DT
             # Kode lama: other_amounts_record = self.generate_oa_record()
-            other_amounts_record = self.generate_oa_record(rec) # OA
+            # Kode lama: other_amounts_record = self.generate_oa_record(rec)
+            other_amounts_record = self.generate_oa_record(rec, next_sequence + 2, transaction_sequence) # OA
             # Kode lama: merchant_batch_record = self.generate_ts_record(rec, str(mid).strip())
-            merchant_batch_record = self.generate_ts_record(rec, mid) # TS
+            # Kode lama: merchant_batch_record = self.generate_ts_record(rec, mid)
+            merchant_batch_record = self.generate_ts_record(rec, mid, next_sequence + 3) # TS
+
+            # Kode lama: trailer_record = self.generate_tr_record()
+            # Keterangan: TR berada setelah empat record baru dan merangkum DT.
+            trailer_record = self.generate_tr_record(
+                next_sequence + 4,
+                existing_lines + [
+                    merchant_header_record.rstrip("\n"),
+                    transaction_record.rstrip("\n"),
+                    other_amounts_record.rstrip("\n"),
+                    merchant_batch_record.rstrip("\n"),
+                ],
+            )
+            logging.info('trailer_record:%s', trailer_record)
 
             # merchant_header_record = self.generate_hs_record(rec, mid) # HS
             # transaction_record = self.generate_dt_record(rec) # DT
@@ -656,10 +701,14 @@ class SplitClass():
                 # Keterangan: beberapa transaksi dapat memperoleh timestamp nama
                 # file yang sama. Pertahankan HR lama, lepaskan TR lama, tambahkan
                 # blok HS/DT/OA/TS baru, kemudian tulis kembali satu TR di akhir.
-                with open(full_path, "r", encoding="utf-8") as existing_file:
-                    existing_containt = existing_file.read()
-                if existing_containt.endswith(trailer_record):
-                    existing_containt = existing_containt[:-len(trailer_record)]
+                # Kode lama membaca isi mentah lalu menghapus TR dengan membandingkan
+                # teks trailer. TR baru memiliki summary dinamis, jadi susun kembali
+                # dari existing_lines yang sejak awal sudah membuang record TR lama.
+                # with open(full_path, "r", encoding="utf-8") as existing_file:
+                #     existing_containt = existing_file.read()
+                # if existing_containt.endswith(trailer_record):
+                #     existing_containt = existing_containt[:-len(trailer_record)]
+                existing_containt = "\n".join(existing_lines) + "\n"
                 full_containt = existing_containt + full_containt_record + trailer_record
             else:
                 # Kode lama untuk transaksi pertama tetap digunakan: HR di awal,
@@ -694,7 +743,93 @@ class SplitClass():
             # print(f"Error when create posting file: {e}")
             # return False
 
-    def generate_hr_record(self):
+    def create_posting_batch_file(self, filename, posting_records, target_split: str, header=None):
+        """Membuat satu POSTFLIN dan mengelompokkan transaksi per merchant/batch."""
+        if not filename or not filename.endswith(".txt"):
+            raise ValueError(f"Invalid posting filename: {filename!r}")
+        if ".." in filename or "/" in filename or "\\" in filename:
+            raise ValueError("filename cannot contain a path")
+
+        full_path = os.path.join(os.path.dirname(target_split), filename)
+
+        # Keterangan: dict mempertahankan urutan kemunculan record dari source.
+        # MID, MPAN dan terminal menjadi identitas satu merchant batch.
+        grouped_records = {}
+        for rec, mid in posting_records:
+            normalized_mid = str(mid).strip()
+            group_key = (
+                normalized_mid,
+                str(rec.merchant_pan).strip(),
+                str(rec.terminal_id).strip(),
+            )
+            grouped_records.setdefault(group_key, []).append(rec)
+
+        sequence_number = 1
+        transaction_sequence = 0
+        voucher_sequence = 0
+        posting_lines = [self.generate_hr_record(header).rstrip("\n")]
+
+        for (mid, _mpan, _terminal_id), records in grouped_records.items():
+            first_rec = records[0]
+            transaction_sequence = 0
+            sequence_number += 1
+            posting_lines.append(
+                self.generate_hs_record(first_rec, mid, sequence_number).rstrip("\n")
+            )
+
+            for rec in records:
+                transaction_sequence += 1
+                voucher_sequence += 1
+                sequence_number += 1
+                posting_lines.append(
+                    self.generate_dt_record(
+                        rec, sequence_number, transaction_sequence, voucher_sequence
+                    ).rstrip("\n")
+                )
+                sequence_number += 1
+                posting_lines.append(
+                    self.generate_oa_record(
+                        rec, sequence_number, voucher_sequence
+                    ).rstrip("\n")
+                )
+
+            sequence_number += 1
+            posting_lines.append(
+                self.generate_ts_record(
+                    first_rec,
+                    mid,
+                    sequence_number,
+                    group_records=records,
+                ).rstrip("\n")
+            )
+
+        sequence_number += 1
+        posting_lines.append(self.generate_tr_record(sequence_number, posting_lines))
+        full_containt = "\n".join(posting_lines)
+
+        # Keterangan: audit format dilakukan sebelum file ditulis/dikirim.
+        expected_lengths = {"HR": 47, "HS": 89, "DT": 147, "OA": 184, "TS": 133, "TR": 74}
+        for line in posting_lines:
+            expected_length = expected_lengths.get(line[:2])
+            if expected_length is None or len(line) != expected_length:
+                raise ValueError(
+                    f"Invalid {line[:2]} record length: {len(line)}, expected {expected_length}"
+                )
+
+        with open(full_path, "w", encoding="utf-8") as generated_file:
+            generated_file.write(full_containt)
+
+        logging.info(
+            "Posting batch generated: %s | groups=%s | transactions=%s | records=%s",
+            full_path,
+            len(grouped_records),
+            voucher_sequence,
+            len(posting_lines),
+        )
+        return full_path
+
+    # Kode lama: def generate_hr_record(self):
+    def generate_hr_record(self, header=None):
         record_type = "HR"
 
         last_sequence_number = 0
@@ -703,42 +838,75 @@ class SplitClass():
         sequence_name = self.pad_with_spaces(self.to_padded_number(8,this_sequence), 8)
 
         bank_code_id = "ID7339"
-        institution_ref = self.generate_spaces(bank_code_id)
+        # Kode lama: institution_ref = self.generate_spaces(bank_code_id)
+        # Keterangan: spek mewajibkan institution reference, sehingga gunakan
+        # kode institution HPS yang sebelumnya sudah disiapkan di bank_code_id.
+        institution_ref = self.pad_with_spaces(bank_code_id, 6)
 
         today_yymmdd = self.pad_with_spaces(self.get_today_yymmdd(), 6)
         ptidn = self.pad_with_spaces(self.to_padded_number(6,this_sequence), 6)
-        file_ref_value = f"PTPN{ptidn} {today_yymmdd}"
+        # Kode lama: file_ref_value = f"PTPN{ptidn} {today_yymmdd}"
+        file_ref_value = f"PTIN{ptidn}{today_yymmdd}"
 
         file_ref = self.pad_with_spaces(file_ref_value, 16)
-        processDate = self.pad_with_spaces(self.get_timestamp_POST(), 14)
+        # Kode lama: processDate = self.pad_with_spaces(self.get_timestamp_POST(), 14)
+        # Keterangan: gunakan Recon File Date dari RH dan waktu proses untuk
+        # memenuhi format YYYYMMDDHH24MISS pada spek.
+        recon_date = str(header.recon_file_date).strip() if header else ""
+        processDate = (
+            recon_date + datetime.datetime.now().strftime("%H%M%S")
+            if len(recon_date) == 8
+            else self.get_timestamp_POST()
+        )
         tokenization_indicator = "C"
 
         # Merging String
         result = record_type + sequence_name + institution_ref + file_ref + processDate + tokenization_indicator
 
+        # Keterangan: posisi terakhir tokenization indicator adalah 47
+        # (posisi 47, panjang 1), sehingga total HR adalah 47 karakter.
+        if len(result) != 47:
+            raise ValueError(f"invalid HR RECORD length:{len(result)}, expected 47")
         return result + "\n"
 
-    def generate_tr_record(self):
+    # Kode lama: def generate_tr_record(self):
+    def generate_tr_record(self, sequence_number=1, posting_lines=None):
         record_type = "TR"
 
         last_sequence_number = 0
         this_sequence = last_sequence_number + 1
 
-        sequence_in_file = self.pad_with_spaces(str(this_sequence), 8)
+        # Kode lama: sequence_in_file = self.pad_with_spaces(str(this_sequence), 8)
+        sequence_in_file = self.to_padded_number(8, sequence_number)
 
-        institution_identification = self.generate_spaces("6")
-        file_sender = self.generate_spaces_int(6)
-        count_debit = self.pad_with_spaces("1000000", 8)
-        count_credit = self.pad_with_spaces("500000", 8)
-        amount_debit = self.pad_with_spaces("2000000", 18)
-        amount_credit = self.pad_with_spaces("1500000", 18)
+        # Kode lama menghasilkan spasi untuk kedua institution code.
+        institution_identification = self.pad_with_spaces("ID7339", 6)
+        file_sender = self.pad_with_spaces("360002", 6)
+
+        posting_lines = posting_lines or []
+        dt_lines = [line for line in posting_lines if line.startswith("DT")]
+        debit_lines = [line for line in dt_lines if len(line) >= 113 and line[112] == "D"]
+        credit_lines = [line for line in dt_lines if len(line) >= 113 and line[112] == "C"]
+        count_debit = self.to_padded_number(8, len(debit_lines))
+        count_credit = self.to_padded_number(8, len(credit_lines))
+        amount_debit_value = sum(int(line[94:112].strip() or "0") for line in debit_lines)
+        amount_credit_value = sum(int(line[94:112].strip() or "0") for line in credit_lines)
+        amount_debit = str(amount_debit_value).zfill(18)
+        amount_credit = str(amount_credit_value).zfill(18)
 
         # Merging String
-        result = record_type + sequence_in_file + institution_identification + file_sender + count_debit + count_credit + amount_debit + amount_credit
+        # Kode lama: ... + amount_debit + amount_credit
+        # Keterangan: spek TR menetapkan net amount credit pada posisi 39 dan
+        # net amount debit pada posisi 57.
+        result = record_type + sequence_in_file + institution_identification + file_sender + count_debit + count_credit + amount_credit + amount_debit
+
+        if len(result) != 74:
+            raise ValueError(f"invalid TR RECORD length:{len(result)}, expected 74")
 
         return result
 
-    def generate_hs_record(self, rec: ReconRecordData, mid: str):
+    # Kode lama: def generate_hs_record(self, rec: ReconRecordData, mid: str):
+    def generate_hs_record(self, rec: ReconRecordData, mid: str, sequence_number=1):
         logging.info('========== GENERATE HS RECORD ==============')
         logging.info('MID:%s', mid)
         logging.info('REC:%s', rec)
@@ -752,14 +920,19 @@ class SplitClass():
         last_batch = 0
         new_batch = last_batch + 1
 
-        record_sequence = self.to_padded_number(8, new_sequence)
+        # Kode lama: record_sequence = self.to_padded_number(8, new_sequence)
+        record_sequence = self.to_padded_number(8, sequence_number)
         merchant_number = self.pad_with_spaces(mid, 15)
         outlet_number = self.pad_with_spaces(mid, 15)
         terminal_id = self.pad_with_spaces(rec.terminal_id, 15)
         batch_number = self.to_padded_number(8, new_batch)
         batch_capture_date = self.pad_with_spaces(self.get_today_yyyymmdd(), 8)
-        batch_datetime = self.pad_with_spaces(self.get_timestamp_POST(), 14)
-        batch_currency = self.pad_with_spaces("360", 3)
+        # Kode lama: batch_datetime = self.pad_with_spaces(self.get_timestamp_POST(), 14)
+        batch_datetime = self.pad_with_spaces(
+            f"{rec.transaction_date}{rec.transaction_time}", 14
+        )
+        # Kode lama: batch_currency = self.pad_with_spaces("360", 3)
+        batch_currency = self.pad_with_spaces(rec.transaction_amount_currency, 3)
         batch_type = "P"
 
         logging.info('HS record_type = [%s] | lenght_2 = %s', record_type, len(record_type))
@@ -767,11 +940,18 @@ class SplitClass():
         logging.info('HS merchant_number = [%s] | lenght_15 = %s', merchant_number, len(merchant_number))
         logging.info('HS outlet_number: [%s] | lenght_15 = %s', outlet_number, len(outlet_number))
         logging.info('HS terminal_id: [%s] | lenght_15 = %s', terminal_id, len(terminal_id))
-        logging.info('HS batch_number = [%s] | lenght_8', batch_number, len(batch_number))
-        logging.info('HS batch_capture_date = [%s] | lenght_8', batch_capture_date, len(batch_capture_date))
-        logging.info('HS batch_datetime = [%s] | lenght_14', batch_datetime, len(batch_datetime))
-        logging.info('HS batch_currency = [%s] | lenght_3', batch_currency, len(batch_currency))
-        logging.info('HS batch_type = [%s] | lenght_1', batch_type, len(batch_type))
+        # Kode lama pada lima log berikut hanya memiliki satu placeholder %s,
+        # padahal mengirim dua argumen dan menyebabkan "Logging error" di Airflow.
+        # logging.info('HS batch_number = [%s] | lenght_8', batch_number, len(batch_number))
+        # logging.info('HS batch_capture_date = [%s] | lenght_8', batch_capture_date, len(batch_capture_date))
+        # logging.info('HS batch_datetime = [%s] | lenght_14', batch_datetime, len(batch_datetime))
+        # logging.info('HS batch_currency = [%s] | lenght_3', batch_currency, len(batch_currency))
+        # logging.info('HS batch_type = [%s] | lenght_1', batch_type, len(batch_type))
+        logging.info('HS batch_number = [%s] | lenght_8 = %s', batch_number, len(batch_number))
+        logging.info('HS batch_capture_date = [%s] | lenght_8 = %s', batch_capture_date, len(batch_capture_date))
+        logging.info('HS batch_datetime = [%s] | lenght_14 = %s', batch_datetime, len(batch_datetime))
+        logging.info('HS batch_currency = [%s] | lenght_3 = %s', batch_currency, len(batch_currency))
+        logging.info('HS batch_type = [%s] | lenght_1 = %s', batch_type, len(batch_type))
 
         # Merging String
         result = record_type + record_sequence + merchant_number + outlet_number + terminal_id + batch_number + batch_capture_date + batch_datetime + batch_currency + batch_type
@@ -783,7 +963,15 @@ class SplitClass():
 
         return result + "\n"
 
-    def generate_dt_record(self, rec: ReconRecordData):
+    # Kode lama: def generate_dt_record(self, rec: ReconRecordData):
+    # Kode lama: def generate_dt_record(self, rec, sequence_number=1, transaction_sequence=1):
+    def generate_dt_record(
+        self,
+        rec: ReconRecordData,
+        sequence_number=1,
+        transaction_sequence=1,
+        voucher_sequence=None,
+    ):
         record_type = "DT"
 
         last_sequence = 0
@@ -793,27 +981,41 @@ class SplitClass():
         new_trx_batch = last_trx_batch + 1
 
         # dummy (temporary)
-        voucher_generated = f"VOUCHER{new_sequence}"
+        # Kode lama: voucher_generated = f"VOUCHER{new_sequence}"
+        voucher_number_sequence = (
+            transaction_sequence if voucher_sequence is None else voucher_sequence
+        )
+        voucher_generated = self.to_padded_number(8, voucher_number_sequence)
 
-        record_sequence_in_file = self.to_padded_number(8, new_sequence)
-        transaction_sequence_in_batch = self.to_padded_number(7, new_trx_batch)
+        # Kode lama menggunakan new_sequence/new_trx_batch yang selalu bernilai 1.
+        record_sequence_in_file = self.to_padded_number(8, sequence_number)
+        transaction_sequence_in_batch = self.to_padded_number(7, transaction_sequence)
         service_type = "0"
         voucher_number = self.pad_with_spaces(voucher_generated, 8)
         # Keterangan: gunakan customer PAN dari record Rintis sebagai card number.
         # Kode lama: card_number = self.generate_spaces_int(22)
         card_number = self.pad_with_spaces(rec.customer_pan, 22)
         expiry_date = self.generate_spaces_int(6)
-        processing_date = self.pad_with_spaces(self.get_today_yyyymm(), 6)
+        # Kode lama: processing_date = self.pad_with_spaces(self.get_today_yyyymm(), 6)
+        # Keterangan: posisi 55 adalah Processing Code, bukan processing date.
+        processing_date = self.pad_with_spaces(rec.processing_code, 6)
         reversal_flag = "N"
         authorization_flag = "A"
-        post_date = self.pad_with_spaces("10000113A110", 12)
-        post_entry_mode = self.pad_with_spaces("A2", 4)
+        # Kode lama: post_date = self.pad_with_spaces("10000113A110", 12)
+        post_date = self.pad_with_spaces("100001154110", 12)
+        # Kode lama: post_entry_mode = self.pad_with_spaces("A2", 4)
+        post_entry_mode = self.pad_with_spaces("012", 4)
         post_condition_code = self.pad_with_spaces("00", 2)
         transaction_datetime = self.pad_with_spaces(f"{rec.transaction_date}{rec.transaction_time}", 14)
-        transaction_amount = self.pad_with_spaces(rec.transaction_amount, 18)
-        transaction_sign = "C"
+        # Kode lama: transaction_amount = self.pad_with_spaces(rec.transaction_amount, 18)
+        transaction_amount = self.to_fixed_numeric(rec.transaction_amount, 18)
+        # Kode lama: transaction_sign = "C"
+        # Keterangan spek: purchase=C dan refund=D; processing code 20/29
+        # merupakan credit voucher/refund.
+        transaction_sign = "D" if rec.processing_code[:2] in {"20", "29"} else "C"
         transaction_currency = self.pad_with_spaces(rec.transaction_amount_currency, 3)
-        currency_exponent = self.generate_spaces_int(1)
+        # Kode lama: currency_exponent = self.generate_spaces_int(1)
+        currency_exponent = "1"
         reversal_reason_code = self.generate_spaces_int(2)
         replacement_amounts = self.generate_spaces_int(18)
         # Keterangan: approval_code tersedia langsung pada record Rintis.
@@ -824,46 +1026,70 @@ class SplitClass():
 
         # Merging String
         result = record_type + record_sequence_in_file + transaction_sequence_in_batch + service_type + voucher_number + card_number + expiry_date + processing_date + reversal_flag + authorization_flag + post_date + post_entry_mode + post_condition_code + transaction_datetime + transaction_amount + transaction_sign + transaction_currency + currency_exponent + reversal_reason_code + replacement_amounts + authorization_code + service_code + single_message_indicator
+        if len(result) != 147:
+            raise ValueError(f"invalid DT RECORD length:{len(result)}, expected 147")
         return result + "\n"
 
     # Kode lama: def generate_oa_record(self):
-    def generate_oa_record(self, rec: ReconRecordData):
+    # Kode lama: def generate_oa_record(self, rec: ReconRecordData):
+    # Kode lama: def generate_oa_record(self, rec, sequence_number=1, transaction_sequence=1):
+    def generate_oa_record(self, rec: ReconRecordData, sequence_number=1, voucher_sequence=1):
         record_type = "OA"
 
         last_sequence = 0
         new_sequence = last_sequence + 1
 
-        sequence = self.to_padded_number(8, new_sequence)
+        # Kode lama: sequence = self.to_padded_number(8, new_sequence)
+        sequence = self.to_padded_number(8, sequence_number)
 
         record_sequence = sequence
-        voucher_number = sequence
+        # Kode lama: voucher_number = sequence
+        voucher_number = self.to_padded_number(8, voucher_sequence)
         tip_amount = self.generate_spaces_int(18)
         cashback_amount = self.generate_spaces_int(18)
         # Keterangan: convenience fee Rintis dipetakan ke field fee dan dipenuhi
         # dengan spasi hingga panjang record OA yang dibutuhkan.
         # Kode lama: fee = self.generate_spaces_int(18)
-        fee = self.pad_with_spaces(rec.convenience_fee, 18)
+        # Kode lama: fee = self.pad_with_spaces(rec.convenience_fee, 18)
+        fee = self.to_fixed_numeric(rec.convenience_fee, 18)
         surcharge_fee = self.generate_spaces_int(18)
         # Keterangan: transaction amount Rintis digunakan sebagai billing amount.
         # Kode lama: billing_amount = self.generate_spaces_int(18)
-        billing_amount = self.pad_with_spaces(rec.transaction_amount, 18)
-        billing_currency = self.pad_with_spaces("360", 3)
+        # Kode lama: billing_amount = self.pad_with_spaces(rec.transaction_amount, 18)
+        billing_amount = self.to_fixed_numeric(rec.transaction_amount, 18)
+        # Kode lama: billing_currency = self.pad_with_spaces("360", 3)
+        billing_currency = self.pad_with_spaces(rec.transaction_amount_currency, 3)
         conversion_rate = self.generate_spaces_int(12)
         rate_exponent = self.generate_spaces_int(2)
-        reversed_for_future_use = ""
+        # Keterangan: spek OA memiliki Rate Date posisi 126 panjang 14.
+        # Field ini sebelumnya terlewat dari susunan record.
+        rate_date = self.generate_spaces_int(14)
+        # Kode lama: reversed_for_future_use = ""
+        reversed_for_future_use = self.generate_spaces_int(9)
         # Keterangan: invoice_data dipakai sebagai external reference karena berasal
         # dari transaksi yang sama dan muat pada field 24 karakter.
         # Kode lama: external_ref_id = self.generate_spaces_int(24)
-        external_ref_id = self.pad_with_spaces(rec.invoice_data, 24)
-        dcc_indicator = "Y"
-        reversed_for_future_use2 = ""
+        # Kode lama: external_ref_id = self.pad_with_spaces(rec.invoice_data, 24)
+        external_ref_id = self.pad_with_spaces(rec.invoice_data, 23)
+        # Kode lama: dcc_indicator = "Y"
+        dcc_indicator = self.generate_spaces_int(1)
+        # Kode lama: reversed_for_future_use2 = ""
+        # Keterangan: reserved terakhir diisi RRN sesuai mapping pada spek.
+        reversed_for_future_use2 = self.pad_with_spaces(rec.retrieval_reference_number, 12)
 
         # Merging String
-        result = record_type + record_sequence + voucher_number + tip_amount + cashback_amount + fee + surcharge_fee + billing_amount + billing_currency + conversion_rate + rate_exponent + reversed_for_future_use + external_ref_id + dcc_indicator + reversed_for_future_use2
+        # Kode lama tidak menyertakan rate_date setelah rate_exponent:
+        # result = record_type + record_sequence + voucher_number + tip_amount + cashback_amount + fee + surcharge_fee + billing_amount + billing_currency + conversion_rate + rate_exponent + reversed_for_future_use + external_ref_id + dcc_indicator + reversed_for_future_use2
+        result = record_type + record_sequence + voucher_number + tip_amount + cashback_amount + fee + surcharge_fee + billing_amount + billing_currency + conversion_rate + rate_exponent + rate_date + reversed_for_future_use + external_ref_id + dcc_indicator + reversed_for_future_use2
 
+        if len(result) != 184:
+            raise ValueError(f"invalid OA RECORD length:{len(result)}, expected 184")
         return result + "\n"
 
-    def generate_ts_record(self, rec: ReconRecordData, mid: str):
+    # Kode lama: def generate_ts_record(self, rec: ReconRecordData, mid: str):
+    def generate_ts_record(
+        self, rec: ReconRecordData, mid: str, sequence_number=1, group_records=None
+    ):
         record_type = "TS"
 
         last_sequence = 0
@@ -872,19 +1098,38 @@ class SplitClass():
         last_batch = 0
         new_batch = last_batch + 1
 
-        sequence_in_file = self.to_padded_number(8, new_sequence)
+        # Kode lama: sequence_in_file = self.to_padded_number(8, new_sequence)
+        sequence_in_file = self.to_padded_number(8, sequence_number)
         merchant_number = self.pad_with_spaces(mid, 15)
         outlet_number = self.pad_with_spaces(mid, 15)
         terminal_id = self.pad_with_spaces(rec.terminal_id, 15)
-        batch_number = self.pad_with_spaces(str(new_batch), 8)
-        batch_datetime = self.pad_with_spaces(self.get_timestamp_POST(), 14)
-        record_count_debit = self.generate_spaces_int(6)
-        net_amount_debit = self.generate_spaces_int(18)
-        record_count_credit = self.generate_spaces_int(6)
-        net_amount_credit = self.generate_spaces_int(18)
+        # Kode lama: batch_number = self.pad_with_spaces(str(new_batch), 8)
+        batch_number = self.to_padded_number(8, new_batch)
+        # Keterangan: field batch capture date posisi 64 panjang 8 sebelumnya
+        # tidak dibuat sehingga TS hanya 125 karakter.
+        batch_capture_date = self.pad_with_spaces(self.get_today_yyyymmdd(), 8)
+        # Kode lama: batch_datetime = self.pad_with_spaces(self.get_timestamp_POST(), 14)
+        batch_datetime = self.pad_with_spaces(
+            f"{rec.transaction_date}{rec.transaction_time}", 14
+        )
+        # Kode lama menghitung summary hanya dari satu rec.
+        records = group_records or [rec]
+        debit_records = [r for r in records if r.processing_code[:2] in {"20", "29"}]
+        credit_records = [r for r in records if r.processing_code[:2] not in {"20", "29"}]
+        record_count_debit = self.to_padded_number(6, len(debit_records))
+        net_amount_debit = self.to_fixed_numeric(
+            sum(int(r.transaction_amount) for r in debit_records), 18
+        )
+        record_count_credit = self.to_padded_number(6, len(credit_records))
+        net_amount_credit = self.to_fixed_numeric(
+            sum(int(r.transaction_amount) for r in credit_records), 18
+        )
 
         # Merging String
-        result = record_type + sequence_in_file + merchant_number + outlet_number + terminal_id + batch_number + batch_datetime + record_count_debit + net_amount_debit + record_count_credit + net_amount_credit
+        # Kode lama tidak menyertakan batch_capture_date.
+        result = record_type + sequence_in_file + merchant_number + outlet_number + terminal_id + batch_number + batch_capture_date + batch_datetime + record_count_debit + net_amount_debit + record_count_credit + net_amount_credit
+        if len(result) != 133:
+            raise ValueError(f"invalid TS RECORD length:{len(result)}, expected 133")
         return result + "\n"
 
     def get_timestamp_POST(self):
@@ -981,6 +1226,23 @@ class SplitClass():
             return num_str.zfill(length)
         except (TypeError, ValueError):
             raise
+
+    def to_fixed_numeric(self, value, length: int):
+        """Normalisasi field NAM menjadi angka zero-padded dengan panjang tetap."""
+        text_value = str(value).strip()
+        # Keterangan: source Rintis dapat memberi prefix C/D sebagai tanda amount.
+        # Tanda transaksi dipetakan pada field sign DT; field NAM hanya berisi digit.
+        if text_value[:1] in {"C", "D"}:
+            text_value = text_value[1:]
+        if not text_value:
+            text_value = "0"
+        if not text_value.isdigit():
+            raise ValueError(f"NAM value must contain digits only: {value!r}")
+        if len(text_value) > length:
+            raise ValueError(
+                f"NAM value length {len(text_value)} exceeds requested length {length}"
+            )
+        return text_value.zfill(length)
 
     def get_data_fetch_one(self):
         logging.info('START Get Data merchant pwc')
