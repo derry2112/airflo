@@ -559,18 +559,18 @@ class SplitClass():
             logging.info('Error split rintis RAW')
             raise
 
-    def get_data_merchant_pwc_qr(self):
-        db = DBConnection(**self.kwares_db_source)
+    # def get_data_merchant_pwc_qr(self):
+    #     db = DBConnection(**self.kwares_db_source)
 
-        # get data new merchant
-        get_merchant_query = "SELECT mpan FROM merchant_tm"
-        logging.info('Get Data Merchant PWC')
-        logging.info(f'Executing query: {get_merchant_query}')
+    #     # get data new merchant
+    #     get_merchant_query = "SELECT mpan FROM merchant_tm"
+    #     logging.info('Get Data Merchant PWC')
+    #     logging.info(f'Executing query: {get_merchant_query}')
 
-        merchants = db.execute_fetch_many(get_merchant_query)
+    #     merchants = db.execute_fetch_many(get_merchant_query)
 
-        logging.info('Finish Get Data Merchant PWC')
-        return merchants
+    #     logging.info('Finish Get Data Merchant PWC')
+    #     return merchants
 
     def get_data_merchant_pwc_qr_acceptor(self):
         logging.info('START Get Data merchant PWC')
