@@ -11,10 +11,7 @@ from data_payment.core.model.Models_DisputePWC import DisputeRecord, SEP, Disput
 # Keterangan: import lama dikomentari karena file dari foto bernama Models_ReconPWC.py.
 from data_payment.core.model.Models_ReconPWC import ReconHeader, ReconRecordData
 import glob, os, logging, zipfile, fnmatch, shutil, datetime, re
-from data_payment.core.connection.ConnectionDB import CommonSQL
-from data_payment.core.connection.BaseConnection import DBConnection
 from data_payment.core.connection.Connection4WAY import Way4DB, PwcDB
-from data_payment.core.connection.ConnectionACQ import ACQ_DB
 
 
 class Replication(object):
@@ -585,7 +582,7 @@ class SplitClass():
 
             if records is None:
                 logging.warning('pwc get data return None')
-                record = []
+                records = []
 
             logging.info('final result ap_on_id: %s', records)
             return records
@@ -924,7 +921,7 @@ class SplitClass():
         record_sequence = self.to_padded_number(8, sequence_number)
         merchant_number = self.pad_with_spaces(mid, 15)
         outlet_number = self.pad_with_spaces(mid, 15)
-        terminal_id = self.pad_with_spaces(rec.terminal_id, 15)
+        terminal_id = self.pad_with_spaces(rec.terminal_id[:15], 15)
         batch_number = self.to_padded_number(8, new_batch)
         batch_capture_date = self.pad_with_spaces(self.get_today_yyyymmdd(), 8)
         # Kode lama: batch_datetime = self.pad_with_spaces(self.get_timestamp_POST(), 14)
