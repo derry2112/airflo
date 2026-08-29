@@ -381,9 +381,15 @@ class Replication(object):
                         pass
 
                     remote_file_mti = os.path.join(self.destination_path, chk_name_mti).replace("\\", "/")
-                    # Kode lama: file PWC diberi nama .chk walaupun sumber upload
-                    # berisi data hasil split, bukan check file.
-                    # remote_file_pwc = os.path.join(self.target_path, chk_name_mti).replace("\\", "/")
+                    destination_hook_mti.store_file(
+                        remote_file_mti,
+                        chk_file_mti,
+                    )
+                    logging.info(
+                        'sukses upload chk hasil split Rintis %s -> %s',
+                        chk_file_mti,
+                        remote_file_mti,
+                    )
                     #COMBINED FILE RINTIS & WAY4
                     # way4_record = self.get_way4_data()
                     # mapped_way4 = split_class.map_way4_query_result(way4_record)

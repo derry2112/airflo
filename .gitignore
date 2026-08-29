@@ -7,6 +7,9 @@ logs/*
 !logs/.gitkeep
 
 !data/.gitkeep
+# Keterangan: hasil upload remote FTP merupakan artefak runtime. File di folder
+# ini dibuat oleh virtual user FTP dan tidak boleh ikut di-index oleh Git.
+data/ftp-destination/
 __pycache__/
 *.py[cod]
 .pytest_cache/
