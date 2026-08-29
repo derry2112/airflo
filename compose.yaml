@@ -16,6 +16,8 @@ services:
       AIRFLOW_CONN_FTP_MII: "ftp://airflow:airflow@ftp:21"
       # Keterangan: dipakai SFTPHook pada proses QR Recon untuk pengiriman ke PWC.
       AIRFLOW_CONN_SFTP_PWC_POST: "sftp://airflow:airflow@sftp-pwc:22"
+      # Database transaksi Way4 yang diakses oleh Connection4WAY.py.
+      AIRFLOW_CONN_DB_REKON_UAT: "postgresql://airflow:airflow@postgres:5432/db_rekon_uat"
       PYTHONPATH: "/opt/airflow/runtime"
     ports:
       - "8080:8080"
@@ -32,6 +34,7 @@ services:
     depends_on:
       - ftp
       - sftp-pwc
+      - postgres
     healthcheck:
       # Healthcheck Airflow 3 lama:
       # test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/monitor/health"]
@@ -52,7 +55,11 @@ services:
       PASV_MIN_PORT: 21100
       PASV_MAX_PORT: 21110
     volumes:
-      - ./data/ACQ_MTI:/home/vsftpd/airflow/ACQ/MII:ro
+      # Konfigurasi lama (typo): source dipasang ke folder MII, sedangkan DAG
+      # membaca /ACQ/MTI/ClearingRintisQRIS/ sehingga file tidak terunduh.
+      # - ./data/ACQ_MTI:/home/vsftpd/airflow/ACQ/MII:ro
+      # Keterangan: samakan mount dengan source_path MTI pada PostFile_QRRecon.py.
+      - ./data/ACQ_MTI:/home/vsftpd/airflow/ACQ/MTI:ro
       - ./data/ftp-destination/sftpdata:/home/vsftpd/airflow/sftpdata
 
   sftp-pwc:
@@ -88,7 +95,30 @@ services:
       retries: 30
       start_period: 60s
 
+  postgres:
+    image: postgres:16-alpine
+    container_name: airflow-postgres
+    environment:
+      POSTGRES_DB: db_rekon_uat
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+    ports:
+      # Konfigurasi lama: port 5432 gagal bind karena sudah dipakai host.
+      # - "5432:5432"
+      # Keterangan: hanya port host dipindah; antar-container tetap memakai 5432.
+      - "5433:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow -d db_rekon_uat"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
 volumes:
   airflow-data:
   airflow2-data:
   oracle-data:
+  postgres-data:

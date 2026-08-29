@@ -320,7 +320,33 @@ class Replication(object):
                     logging.info('=============== SPLIT START ==============')
                     logging.info('start split MTI: %s', pwc_source_file)
                     logging.info('start split PWC: %s', mti_source_file)
-                    generated_posting_files = split_class.split_rintis_qr_recon(str_file_name=source_file, str_result_name=mti_source_file, str_result_pwc=pwc_source_file)
+                    # Kode lama hanya memproses data Rintis tanpa mengambil Way4:
+                    # generated_posting_files = split_class.split_rintis_qr_recon(
+                    #     str_file_name=source_file,
+                    #     str_result_name=mti_source_file,
+                    #     str_result_pwc=pwc_source_file,
+                    # )
+                    # Keterangan: Way4 harus diambil dan dipetakan sebelum generator
+                    # dipanggil agar Rintis dan Way4 masuk ke POSTFLIN yang sama.
+                    period = date.strftime("%Y%m%d")
+                    way4_records = self.get_way4_data(
+                        period=period,
+                        save_result_file=False,
+                    )
+                    way4_posting_records = split_class.map_way4_to_posting_records(
+                        way4_records
+                    )
+                    logging.info(
+                        'Way4 records ready to combine: %s',
+                        len(way4_posting_records),
+                    )
+
+                    generated_posting_files = split_class.split_rintis_qr_recon(
+                        str_file_name=source_file,
+                        str_result_name=mti_source_file,
+                        str_result_pwc=pwc_source_file,
+                        way4_posting_records=way4_posting_records,
+                    )
                     # Kode lama:
                     # split_class.split_rintis_qr_recon(str_file_name=source_file, str_result_name=mti_source_file, str_result_pwc=pwc_source_file)
                     # mapped_rintis = split_class.split_rintis_qr_recon(str_file_name=source_file, str_result_name=mti_source_file, str_result_pwc=pwc_source_file)
@@ -423,13 +449,144 @@ class Replication(object):
             logging.exception(e)
             raise
 
-    # Keterangan: method pendukung dibuat agar task get_way4_data pada BaseDags_QRRecon dapat dimuat.
-    def get_way4_data(self):
-        logging.info('========== START GET WAY4 DATA ==========')
-        split_class = SplitClass()
-        records = split_class.get_data_fetch_one()
-        logging.info('========== END GET WAY4 DATA: %s ==========', records)
-        return records
+    # Kode lama sebelum implementasi dari foto:
+    # def get_way4_data(self):
+    #     logging.info('========== START GET WAY4 DATA ==========')
+    #     split_class = SplitClass()
+    #     records = split_class.get_data_fetch_one()
+    #     logging.info('========== END GET WAY4 DATA: %s ==========', records)
+    #     return records
+    # Kode lama hasil salinan foto:
+    # def get_way4_data(self, period=None):
+    # Keterangan: parameter save_result_file ditambahkan agar proses combine dapat
+    # mengambil record tanpa membuat file Way4 terpisah sebelum POSTFLIN digabung.
+    def get_way4_data(self, period=None, save_result_file=True):
+        con_acq = None
+        try:
+            split_class = SplitClass(self.kwares_db_source)
+            timestamp = split_class.get_timestamp_POST()
+            if period is None:
+                if len(timestamp) < 8 or not timestamp[:8].isdigit():
+                    raise ValueError(
+                        f"Format timestamp POST tidak valid: {timestamp!r}"
+                    )
+                period = timestamp[:8]
+
+            get_con_acq = split_class.get_data_fetch_one()
+            con_acq = tuple(
+                sorted(
+                    {
+                        str(row[0]).strip()
+                        for row in get_con_acq
+                        if row and row[0] is not None and str(row[0]).strip()
+                    }
+                )
+            )
+
+            if not con_acq:
+                logging.warning('Tidak ada connection_acq yang bisa diproses')
+                return []
+
+            logging.info('get_con_acq:%s', con_acq)
+            logging.info('period:%s', period)
+
+            con_acq_params = {
+                f"con_acq_{index}": value
+                for index, value in enumerate(con_acq)
+            }
+            con_acq_placeholder = ", ".join(
+                f"%(con_acq_{index})s" for index in range(len(con_acq))
+            )
+            # Query lama sebelum penyesuaian spek Way4:
+            # SELECT institutionbranch_acq, sourceregnum, pan, period, stan, rrn,
+            #        institution_acq, transactiontype, settlementdate,
+            #        settlementcurrency, transactionamount,
+            #        transactionchargeamount
+            # Keterangan: spek membutuhkan tanggal/waktu, recon amount, transaction
+            # currency, merchant/outlet, authorization, RC, dan reversal sequence.
+            sql = """
+                SELECT
+                    institutionbranch_acq,
+                    sourceregnum,
+                    pan,
+                    period,
+                    periodtime,
+                    stan,
+                    rrn,
+                    institution_acq,
+                    transactiontype,
+                    settlementdate,
+                    settlementcurrency,
+                    reconamount,
+                    transactioncurrency,
+                    transactionchargeamount,
+                    merchantid,
+                    auth_code,
+                    rc,
+                    reversalseq
+                FROM sw_replicate.on_doc_transaction
+                WHERE period = %(period)s
+                  AND connection_acq IN ({con_acq})
+                ORDER BY period DESC
+                LIMIT 10
+            """.format(con_acq=con_acq_placeholder)
+
+            logging.info('============ START GET DATA WAY4 ============')
+            logging.info('period: %s', period)
+            logging.info('con_acq: %s', con_acq)
+            logging.info('sql: %s', sql)
+
+            way4 = Way4DB()
+            logging.info('connection db way4')
+
+            records = way4.get_data(
+                sql=sql,
+                params={"period": period, **con_acq_params},
+            )
+
+            if records is None:
+                logging.warning(
+                    'way4 get data return None | period=%s | con_acq=%s',
+                    period,
+                    con_acq,
+                )
+                records = []
+
+            # Kode lama selalu membuat file terpisah ketika records tersedia:
+            # if records:
+            # Keterangan: pada alur combine, record dikembalikan ke pemanggil tanpa
+            # membuat file Way4 mentah; perilaku lama tetap menjadi default.
+            if records and save_result_file:
+                os.makedirs(self.result_local_way4, exist_ok=True)
+                spek_name_pwc = f"POSTFLIN_{timestamp}.txt"
+                result_file = os.path.join(self.result_local_way4, spek_name_pwc)
+                logging.info('Save way4 result to file:%s', result_file)
+
+                with open(result_file, "w") as file:
+                    for row in records:
+                        file.write(
+                            "|".join(
+                                "" if value is None else str(value)
+                                for value in row
+                            )
+                        )
+                        file.write("\n")
+
+                logging.info(
+                    'way4 result file created:%s | total records:%s',
+                    result_file,
+                    len(records),
+                )
+
+            return records
+        except Exception as e:
+            logging.exception(
+                'Gagal mengambil data WAY4 | period=%s | con_acq=%s | error: %s',
+                period,
+                con_acq,
+                e,
+            )
+            raise
 
 
 class SplitClass():
@@ -437,7 +594,17 @@ class SplitClass():
         self.kwares_db_source = kwares_db_source
         logging.info(f"config: kwares_db_source={self.kwares_db_source}")
         
-    def split_rintis_qr_recon(self, str_file_name, str_result_name, str_result_pwc):
+    # Kode lama:
+    # def split_rintis_qr_recon(self, str_file_name, str_result_name, str_result_pwc):
+    # Keterangan: way4_posting_records ditambahkan sebagai input record yang akan
+    # digabung bersama record Rintis sebelum create_posting_batch_file dijalankan.
+    def split_rintis_qr_recon(
+        self,
+        str_file_name,
+        str_result_name,
+        str_result_pwc,
+        way4_posting_records=None,
+    ):
         try:
             logging.info('========== SPLIT PROCESSED START QR RECON ==========')
 
@@ -467,6 +634,9 @@ class SplitClass():
             # source file menghasilkan satu POSTFLIN dan dapat dikelompokkan per
             # merchant/batch sesuai susunan HR-HS-(DT/OA)-TS-TR.
             pwc_posting_records = []
+            # Kode lama tidak memiliki koleksi record Way4 pada method ini.
+            # Keterangan: selalu ubah input opsional menjadi list agar aman di-extend.
+            way4_posting_records = list(way4_posting_records or [])
             posting_filename = None
 
             for line in file_unprocessed:
@@ -542,6 +712,16 @@ class SplitClass():
 
                     file_processed.write(line[:28] + str(row_count)+'|'+str(record))
                     file_processed_PWC.write(hd.to_header_line()+'|'+str(record_pwc))
+                    # Kode lama langsung membuat file hanya dari pwc_posting_records:
+                    # if pwc_posting_records:
+                    #     generated_posting_file = self.create_posting_batch_file(...)
+                    # Keterangan: tambahkan Way4 sebelum pengecekan dan pembuatan file
+                    # sehingga satu HR/TR membungkus kedua sumber data.
+                    pwc_posting_records.extend(way4_posting_records)
+                    if posting_filename is None and pwc_posting_records:
+                        posting_filename = (
+                            f"POSTFLIN_{self.get_timestamp_POST()}.txt"
+                        )
                     if pwc_posting_records:
                         generated_posting_file = self.create_posting_batch_file(
                             posting_filename,
@@ -616,129 +796,6 @@ class SplitClass():
         except Exception as e:
             logging.exception('Gagal ambil data MID dari PWC')
             raise
-
-    def create_posting_file(self, filename, rec: ReconRecordData, mid: str, target_split: str):
-        try:
-            logging.info("================ CREATE POSTING FILE ====================")
-
-            logging.info('filename:%s', filename)
-            logging.info('filename type: %s', type(filename))
-            logging.info('mid:%s', mid)
-            # Kode lama: logging.info('rec.to_line', rec.to_line())
-            logging.info('rec.to_line: %s', rec.to_line())
-            if not isinstance(filename, str) or not filename.endswith(".txt"):
-                raise ValueError(f"Filename must be string type and .txt extention. Got: {filename!r}, type:{type(filename)}")
-
-            if ".." in filename or "/" in filename or "\\" in filename:
-                raise ValueError("filename cannot contain a path")
-
-            # full_path = os.path.join(target_split)
-            full_path = os.path.join(os.path.dirname(target_split),filename)
-
-            header_record = self.generate_hr_record()
-
-            # Keterangan: sequence file tidak boleh selalu kembali ke 00000001.
-            # Ambil jumlah record yang sudah ada (tanpa TR) agar record berikutnya
-            # mendapat sequence yang berurutan dan voucher DT sama dengan OA.
-            existing_lines = []
-            if os.path.isfile(full_path):
-                with open(full_path, "r", encoding="utf-8") as existing_file:
-                    existing_lines = existing_file.read().splitlines()
-                existing_lines = [line for line in existing_lines if not line.startswith("TR")]
-            next_sequence = len(existing_lines) + 1 if existing_lines else 2
-            transaction_sequence = sum(1 for line in existing_lines if line.startswith("DT")) + 1
-
-            logging.info('full path:%s', full_path)
-            logging.info('header_record:%s',header_record)
-            # Kode lama berada sebelum trailer_record dibuat dan dapat memicu
-            # NameError: logging.info('trailer_record:%s', trailer_record)
-
-            # Keterangan: normalisasi MID satu kali agar nilai yang sama digunakan
-            # secara konsisten oleh generator HS dan TS.
-            mid = str(mid).strip()
-
-            # Kode lama: merchant_header_record = self.generate_hs_record(rec, str(mid).strip())
-            # Kode lama: merchant_header_record = self.generate_hs_record(rec, mid)
-            merchant_header_record = self.generate_hs_record(rec, mid, next_sequence) # HS
-            # Kode lama: transaction_record = self.generate_dt_record(rec)
-            transaction_record = self.generate_dt_record(rec, next_sequence + 1, transaction_sequence) # DT
-            # Kode lama: other_amounts_record = self.generate_oa_record()
-            # Kode lama: other_amounts_record = self.generate_oa_record(rec)
-            other_amounts_record = self.generate_oa_record(rec, next_sequence + 2, transaction_sequence) # OA
-            # Kode lama: merchant_batch_record = self.generate_ts_record(rec, str(mid).strip())
-            # Kode lama: merchant_batch_record = self.generate_ts_record(rec, mid)
-            merchant_batch_record = self.generate_ts_record(rec, mid, next_sequence + 3) # TS
-
-            # Kode lama: trailer_record = self.generate_tr_record()
-            # Keterangan: TR berada setelah empat record baru dan merangkum DT.
-            trailer_record = self.generate_tr_record(
-                next_sequence + 4,
-                existing_lines + [
-                    merchant_header_record.rstrip("\n"),
-                    transaction_record.rstrip("\n"),
-                    other_amounts_record.rstrip("\n"),
-                    merchant_batch_record.rstrip("\n"),
-                ],
-            )
-            logging.info('trailer_record:%s', trailer_record)
-
-            # merchant_header_record = self.generate_hs_record(rec, mid) # HS
-            # transaction_record = self.generate_dt_record(rec) # DT
-            # other_amounts_record = self.generate_oa_record() # OA
-            # merchant_batch_record = self.generate_ts_record(rec, mid) # TS
-
-            logging.info('merchant_header_record:%s', merchant_header_record)
-            logging.info('transaction_record:%s', transaction_record)
-            logging.info('other_amounts_record:%s', other_amounts_record)
-            logging.info('merchant_batch_record:%s', merchant_batch_record)
-
-            full_containt_record = merchant_header_record + transaction_record + other_amounts_record + merchant_batch_record
-
-            if os.path.isfile(full_path):
-                # Keterangan: beberapa transaksi dapat memperoleh timestamp nama
-                # file yang sama. Pertahankan HR lama, lepaskan TR lama, tambahkan
-                # blok HS/DT/OA/TS baru, kemudian tulis kembali satu TR di akhir.
-                # Kode lama membaca isi mentah lalu menghapus TR dengan membandingkan
-                # teks trailer. TR baru memiliki summary dinamis, jadi susun kembali
-                # dari existing_lines yang sejak awal sudah membuang record TR lama.
-                # with open(full_path, "r", encoding="utf-8") as existing_file:
-                #     existing_containt = existing_file.read()
-                # if existing_containt.endswith(trailer_record):
-                #     existing_containt = existing_containt[:-len(trailer_record)]
-                existing_containt = "\n".join(existing_lines) + "\n"
-                full_containt = existing_containt + full_containt_record + trailer_record
-            else:
-                # Kode lama untuk transaksi pertama tetap digunakan: HR di awal,
-                # satu blok transaksi, lalu TR di akhir file.
-                # full_containt = header_record + full_containt_record + trailer_record
-                full_containt = header_record + full_containt_record + trailer_record
-
-            # logging.info('full_containt_record:%s',full_containt_record)
-            logging.info('full_containt:%s', full_containt)
-            logging.info("Create file : %s", full_path)
-
-            with open(full_path, "w", encoding="utf-8") as f:
-                # Keterangan: gunakan variabel full_containt yang dibentuk dari
-                # gabungan record HR, HS, DT, OA, TS, dan TR pada baris sebelumnya.
-                # Kode lama: f.write(full_contain)
-                f.write(full_containt)
-
-            file_exists = os.path.isfile(full_path)
-            logging.info("File generated: %s", full_path)
-            logging.info("File Exists: %s", file_exists)
-
-            if not file_exists:
-                raise FileNotFoundError(f"Generated posting file not found:{full_path}")
-
-            # Keterangan: path ini diteruskan sampai ke store_file() agar file yang
-            # diunggah adalah hasil generator, bukan pwc_source_file mentah.
-            return full_path
-
-        except Exception as e:
-            logging.exception(e)
-            raise
-            # print(f"Error when create posting file: {e}")
-            # return False
 
     def create_posting_batch_file(self, filename, posting_records, target_split: str, header=None):
         """Membuat satu POSTFLIN dan mengelompokkan transaksi per merchant/batch."""
@@ -919,17 +976,32 @@ class SplitClass():
 
         # Kode lama: record_sequence = self.to_padded_number(8, new_sequence)
         record_sequence = self.to_padded_number(8, sequence_number)
-        merchant_number = self.pad_with_spaces(mid, 15)
-        outlet_number = self.pad_with_spaces(mid, 15)
+        merchant_number = self.pad_with_spaces(mid[:15], 15)
+        # Kode lama: outlet_number = self.pad_with_spaces(mid, 15)
+        # Keterangan: spek Way4 menetapkan Outlet Number dari merchantid. Record
+        # Rintis yang tidak memiliki atribut outlet_number tetap memakai MID.
+        outlet_value = str(getattr(rec, "outlet_number", mid))
+        outlet_number = self.pad_with_spaces(outlet_value[:15], 15)
         terminal_id = self.pad_with_spaces(rec.terminal_id[:15], 15)
         batch_number = self.to_padded_number(8, new_batch)
-        batch_capture_date = self.pad_with_spaces(self.get_today_yyyymmdd(), 8)
+        # Kode lama: batch_capture_date = self.pad_with_spaces(self.get_today_yyyymmdd(), 8)
+        # Keterangan: spek Way4 menetapkan Batch Capture Date dari period.
+        capture_date = str(
+            getattr(rec, "batch_capture_date", self.get_today_yyyymmdd())
+        )
+        batch_capture_date = self.pad_with_spaces(capture_date[:8], 8)
         # Kode lama: batch_datetime = self.pad_with_spaces(self.get_timestamp_POST(), 14)
         batch_datetime = self.pad_with_spaces(
             f"{rec.transaction_date}{rec.transaction_time}", 14
         )
         # Kode lama: batch_currency = self.pad_with_spaces("360", 3)
-        batch_currency = self.pad_with_spaces(rec.transaction_amount_currency, 3)
+        # Kode lama: batch_currency = self.pad_with_spaces(rec.transaction_amount_currency, 3)
+        # Keterangan: HS Way4 memakai settlementcurrency, sedangkan Rintis tetap
+        # memakai transaction_amount_currency melalui nilai fallback.
+        batch_currency_value = str(
+            getattr(rec, "batch_currency", rec.transaction_amount_currency)
+        )
+        batch_currency = self.pad_with_spaces(batch_currency_value[:3], 3)
         batch_type = "P"
 
         logging.info('HS record_type = [%s] | lenght_2 = %s', record_type, len(record_type))
@@ -985,39 +1057,45 @@ class SplitClass():
         voucher_generated = self.to_padded_number(8, voucher_number_sequence)
 
         # Kode lama menggunakan new_sequence/new_trx_batch yang selalu bernilai 1.
+        # Kode lama (menimbulkan TypeError karena integer tidak dapat di-slice):
+        # record_sequence_in_file = self.to_padded_number(8[:8], sequence_number)
+        # transaction_sequence_in_batch = self.to_padded_number(7[:7], transaction_sequence)
+        # Keterangan: argumen pertama to_padded_number adalah panjang bertipe int.
         record_sequence_in_file = self.to_padded_number(8, sequence_number)
         transaction_sequence_in_batch = self.to_padded_number(7, transaction_sequence)
         service_type = "0"
-        voucher_number = self.pad_with_spaces(voucher_generated, 8)
+        voucher_number = self.pad_with_spaces(voucher_generated[:8], 8)
         # Keterangan: gunakan customer PAN dari record Rintis sebagai card number.
         # Kode lama: card_number = self.generate_spaces_int(22)
-        card_number = self.pad_with_spaces(rec.customer_pan, 22)
+        card_number = self.pad_with_spaces(rec.customer_pan[:22], 22)
         expiry_date = self.generate_spaces_int(6)
         # Kode lama: processing_date = self.pad_with_spaces(self.get_today_yyyymm(), 6)
         # Keterangan: posisi 55 adalah Processing Code, bukan processing date.
-        processing_date = self.pad_with_spaces(rec.processing_code, 6)
-        reversal_flag = "N"
+        processing_date = self.pad_with_spaces(rec.processing_code[:6], 6)
+        # Kode lama: reversal_flag = "N"
+        # Keterangan: default tetap N; record Way4 dengan reversalseq > 0 memakai F.
+        reversal_flag = str(getattr(rec, "reversal_flag", "N"))[:1]
         authorization_flag = "A"
         # Kode lama: post_date = self.pad_with_spaces("10000113A110", 12)
-        post_date = self.pad_with_spaces("100001154110", 12)
+        post_date = self.pad_with_spaces("100001154110"[:12], 12)
         # Kode lama: post_entry_mode = self.pad_with_spaces("A2", 4)
-        post_entry_mode = self.pad_with_spaces("012", 4)
-        post_condition_code = self.pad_with_spaces("00", 2)
+        post_entry_mode = self.pad_with_spaces("012"[:4], 4)
+        post_condition_code = self.pad_with_spaces("00"[:2], 2)
         transaction_datetime = self.pad_with_spaces(f"{rec.transaction_date}{rec.transaction_time}", 14)
         # Kode lama: transaction_amount = self.pad_with_spaces(rec.transaction_amount, 18)
-        transaction_amount = self.to_fixed_numeric(rec.transaction_amount, 18)
+        transaction_amount = self.to_fixed_numeric(rec.transaction_amount[:18], 18)
         # Kode lama: transaction_sign = "C"
         # Keterangan spek: purchase=C dan refund=D; processing code 20/29
         # merupakan credit voucher/refund.
         transaction_sign = "D" if rec.processing_code[:2] in {"20", "29"} else "C"
-        transaction_currency = self.pad_with_spaces(rec.transaction_amount_currency, 3)
+        transaction_currency = self.pad_with_spaces(rec.transaction_amount_currency[:3], 3)
         # Kode lama: currency_exponent = self.generate_spaces_int(1)
         currency_exponent = "1"
         reversal_reason_code = self.generate_spaces_int(2)
         replacement_amounts = self.generate_spaces_int(18)
         # Keterangan: approval_code tersedia langsung pada record Rintis.
         # Kode lama: authorization_code = self.pad_with_spaces("RC", 6)
-        authorization_code = self.pad_with_spaces(rec.approval_code, 6)
+        authorization_code = self.pad_with_spaces(rec.approval_code[:6], 6)
         service_code = self.generate_spaces_int(3)
         single_message_indicator = "Y"
 
@@ -1041,6 +1119,9 @@ class SplitClass():
 
         record_sequence = sequence
         # Kode lama: voucher_number = sequence
+        # Kode lama (menimbulkan TypeError karena integer tidak dapat di-slice):
+        # voucher_number = self.to_padded_number(8[:8], voucher_sequence)
+        # Keterangan: panjang voucher dikirim sebagai integer 8.
         voucher_number = self.to_padded_number(8, voucher_sequence)
         tip_amount = self.generate_spaces_int(18)
         cashback_amount = self.generate_spaces_int(18)
@@ -1048,14 +1129,14 @@ class SplitClass():
         # dengan spasi hingga panjang record OA yang dibutuhkan.
         # Kode lama: fee = self.generate_spaces_int(18)
         # Kode lama: fee = self.pad_with_spaces(rec.convenience_fee, 18)
-        fee = self.to_fixed_numeric(rec.convenience_fee, 18)
+        fee = self.to_fixed_numeric(rec.convenience_fee[:18], 18)
         surcharge_fee = self.generate_spaces_int(18)
         # Keterangan: transaction amount Rintis digunakan sebagai billing amount.
         # Kode lama: billing_amount = self.generate_spaces_int(18)
         # Kode lama: billing_amount = self.pad_with_spaces(rec.transaction_amount, 18)
-        billing_amount = self.to_fixed_numeric(rec.transaction_amount, 18)
+        billing_amount = self.to_fixed_numeric(rec.transaction_amount[:18], 18)
         # Kode lama: billing_currency = self.pad_with_spaces("360", 3)
-        billing_currency = self.pad_with_spaces(rec.transaction_amount_currency, 3)
+        billing_currency = self.pad_with_spaces(rec.transaction_amount_currency[:3], 3)
         conversion_rate = self.generate_spaces_int(12)
         rate_exponent = self.generate_spaces_int(2)
         # Keterangan: spek OA memiliki Rate Date posisi 126 panjang 14.
@@ -1067,12 +1148,12 @@ class SplitClass():
         # dari transaksi yang sama dan muat pada field 24 karakter.
         # Kode lama: external_ref_id = self.generate_spaces_int(24)
         # Kode lama: external_ref_id = self.pad_with_spaces(rec.invoice_data, 24)
-        external_ref_id = self.pad_with_spaces(rec.invoice_data, 23)
+        external_ref_id = self.pad_with_spaces(rec.invoice_data[:23], 23)
         # Kode lama: dcc_indicator = "Y"
         dcc_indicator = self.generate_spaces_int(1)
         # Kode lama: reversed_for_future_use2 = ""
         # Keterangan: reserved terakhir diisi RRN sesuai mapping pada spek.
-        reversed_for_future_use2 = self.pad_with_spaces(rec.retrieval_reference_number, 12)
+        reversed_for_future_use2 = self.pad_with_spaces(rec.retrieval_reference_number[:12], 12)
 
         # Merging String
         # Kode lama tidak menyertakan rate_date setelah rate_exponent:
@@ -1097,9 +1178,16 @@ class SplitClass():
 
         # Kode lama: sequence_in_file = self.to_padded_number(8, new_sequence)
         sequence_in_file = self.to_padded_number(8, sequence_number)
-        merchant_number = self.pad_with_spaces(mid, 15)
-        outlet_number = self.pad_with_spaces(mid, 15)
-        terminal_id = self.pad_with_spaces(rec.terminal_id, 15)
+        merchant_number = self.pad_with_spaces(mid[:15], 15)
+        # Kode lama: outlet_number = self.pad_with_spaces(mid, 15)
+        # Keterangan: TS harus memakai outlet yang sama dengan HS.
+        outlet_value = str(getattr(rec, "outlet_number", mid))
+        outlet_number = self.pad_with_spaces(outlet_value[:15], 15)
+        # Kode lama:
+        # terminal_id = self.pad_with_spaces(rec.terminal_id, 15)
+        # Keterangan: pad_with_spaces tidak memotong nilai lebih panjang; terminal
+        # harus dipotong agar record TS tetap tepat 133 karakter sesuai spek.
+        terminal_id = self.pad_with_spaces(rec.terminal_id[:15], 15)
         # Kode lama: batch_number = self.pad_with_spaces(str(new_batch), 8)
         batch_number = self.to_padded_number(8, new_batch)
         # Keterangan: field batch capture date posisi 64 panjang 8 sebelumnya
@@ -1242,13 +1330,24 @@ class SplitClass():
         return text_value.zfill(length)
 
     def get_data_fetch_one(self):
+        # Kode lama:
+        # logging.info(f"get_data: kwares_db_source={self.kwares_db_source}")
+        # Keterangan: konfigurasi ini tidak digunakan oleh Way4DB karena koneksi
+        # dibaca melalui Airflow connection db_rekon_uat.
         logging.info('START Get Data merchant pwc')
-        logging.info(f"get_data: kwares_db_source={self.kwares_db_source}")
         try:
             way4 = Way4DB()
+            # Kode lama hasil salinan foto tidak memiliki spasi di batas string:
+            # merchant_query = (
+            #     "SELECT DISTINCT connection_acq"
+            #     "FROM sw_replicate.on_doc_transaction"
+            #     "WHERE connection_acq IS NOT NULL"
+            # )
+            # Keterangan: literal Python yang bersebelahan digabung langsung,
+            # sehingga spasi ditambahkan agar query PostgreSQL valid.
             merchant_query = (
-                "SELECT DISTINCT connection_acq"
-                "FROM sw_replicate.on_doc_transaction"
+                "SELECT DISTINCT connection_acq "
+                "FROM sw_replicate.on_doc_transaction "
                 "WHERE connection_acq IS NOT NULL"
             )
             logging.info('Get data Way4')
@@ -1259,8 +1358,289 @@ class SplitClass():
             if records is None:
                 logging.warning('Way4 get data return None')
                 records = []
-            logging.info('final result: %s', records)
+
+            # Kode lama: logging.info('final result: %s', records)
+            # Keterangan: hanya kapitalisasi pesan log; nilai records tidak berubah.
+            logging.info('Final result: %s', records)
             return records
-        except Exception as e:
-            logging.exception(e)
+        # Kode lama:
+        # except Exception as e:
+        #     logging.exception(e)
+        # Keterangan: pesan eksplisit memudahkan identifikasi sumber kegagalan log.
+        except Exception:
+            logging.exception('Gagal ambil data Way4')
             raise
+
+    def combine_mapped_posting_result(
+        self,
+        mapped_rintis,
+        mapped_way4,
+        output_directory,
+        filename=None,
+    ):
+        mapped_rintis = list(mapped_rintis or [])
+        mapped_way4 = list(mapped_way4 or [])
+
+        if filename is None:
+            timestamp = self.get_timestamp_POST()
+            filename = f"POSTFLIN_{timestamp}.txt"
+
+        if not isinstance(filename, str) or not filename.endswith(".txt"):
+            raise ValueError("filename must be string ext .txt")
+        if ".." in filename or "/" in filename or "\\" in filename:
+            raise ValueError("filename not be path")
+
+        os.makedirs(output_directory, exist_ok=True)
+        full_path = os.path.join(output_directory, filename)
+
+        # Kode lama hasil salinan foto:
+        # posting_file = "".join(
+        #     [self.generate_hr_record()]
+        #     + mapped_rintis
+        #     + mapped_way4
+        #     + [self.generate_tr_record()]
+        # )
+        # Keterangan: trailer lama tidak menerima posting_lines sehingga count dan
+        # amount TR selalu nol. Body diurai agar TR menghitung seluruh DT gabungan.
+        body = mapped_rintis + mapped_way4
+        body_lines = [
+            line
+            for block in body
+            for line in block.splitlines()
+            if line
+        ]
+        header = self.generate_hr_record()
+        trailer = self.generate_tr_record(
+            sequence_number=len(body_lines) + 2,
+            posting_lines=body_lines,
+        )
+        posting_file = header + "".join(body) + trailer
+        with open(full_path, "w", encoding="utf-8") as posting_files:
+            posting_files.write(posting_file)
+
+        if not os.path.isfile(full_path):
+            raise FileNotFoundError(f"Combine posting file not found: {full_path}")
+
+        logging.info(
+            "Combine posting created: %s | rintis: %s | way4: %s | size: %s",
+            full_path,
+            len(mapped_rintis),
+            len(mapped_way4),
+            os.path.getsize(full_path),
+        )
+        return full_path
+
+    def map_record_to_posting_block(self, rec, mid):
+        mid = str(mid).strip()
+        if not mid:
+            raise ValueError("Mid result mapping is not null")
+        # Kode lama hasil salinan foto menghasilkan HS dua kali:
+        # return (
+        #     self.generate_hs_record(rec, str(mid).strip())
+        #     + self.generate_dt_record(rec)
+        #     + self.generate_hs_record(rec, str(mid).strip())
+        #     + self.generate_ts_record(rec, str(mid).strip())
+        # )
+        # Keterangan: HS kedua diganti OA agar urutan batch sesuai spek
+        # HS -> DT -> OA -> TS.
+        return (
+            self.generate_hs_record(rec, str(mid).strip())
+            + self.generate_dt_record(rec)
+            + self.generate_oa_record(rec)
+            + self.generate_ts_record(rec, str(mid).strip())
+        )
+
+    def map_way4_to_posting_records(self, records):
+        """Map hasil query Way4 menjadi pasangan ReconRecordData dan MID."""
+        # Kolom lama sebelum penyesuaian spek:
+        # columns = (
+        #     "institutionbranch_acq", "sourceregnum", "pan", "period",
+        #     "stan", "rrn", "institution_acq", "transactiontype",
+        #     "settlementdate", "settlementcurrency", "transactionamount",
+        #     "transactionchargeamount",
+        # )
+        # Keterangan: urutan ini harus sama persis dengan SELECT get_way4_data.
+        columns = (
+            "institutionbranch_acq",
+            "sourceregnum",
+            "pan",
+            "period",
+            "periodtime",
+            "stan",
+            "rrn",
+            "institution_acq",
+            "transactiontype",
+            "settlementdate",
+            "settlementcurrency",
+            "reconamount",
+            "transactioncurrency",
+            "transactionchargeamount",
+            "merchantid",
+            "auth_code",
+            "rc",
+            "reversalseq",
+        )
+
+        def text(value, default=""):
+            return default if value is None else str(value).strip()
+
+        def numeric(value, length):
+            if value is None:
+                return "0".zfill(length)
+            value_text = format(value, "f") if hasattr(value, "as_tuple") else str(value)
+            value_text = value_text.strip()
+            if "." in value_text:
+                integer, fraction = value_text.split(".", 1)
+                if fraction.strip("0"):
+                    value_text = str(int(round(float(value_text))))
+                else:
+                    value_text = integer
+            value_text = value_text.lstrip("+") or "0"
+            if not value_text.isdigit():
+                raise ValueError(f"Invalid Way4 numeric value: {value!r}")
+            return value_text[-length:].zfill(length)
+
+        def processing_code(transaction_type):
+            """Turunkan processing code 6 digit sesuai tabel mapping Way4."""
+            raw_value = text(transaction_type).upper()
+            first_two = raw_value[:2]
+            supported_codes = {
+                "00", "01", "09", "11", "12", "17", "19", "20", "21",
+                "28", "29", "40", "92", "93", "94", "95", "96", "97",
+            }
+            if first_two in supported_codes:
+                return first_two + "0000"
+
+            text_mapping = {
+                "RETAIL": "00",
+                "PURCHASE": "00",
+                "CHK_RCPT": "00",
+                "CH PAYMENT": "00",
+                "IB_TRF": "40",
+                "TRANSFER": "40",
+                "REFUND": "20",
+                "CREDIT VOUCHER": "20",
+                "WITHDRAWAL": "01",
+                "CASH": "11",
+                "DEPOSIT": "21",
+                "LOAN": "92",
+                "REDEMPTION": "94",
+                "CONVENIENCE FEE": "97",
+                "BALANCE INQUIRY": "00",
+            }
+            mapped_code = text_mapping.get(raw_value)
+            if mapped_code is None:
+                logging.warning(
+                    'transactiontype Way4 belum dikenal, fallback purchase: %r',
+                    transaction_type,
+                )
+                mapped_code = "00"
+            return mapped_code + "0000"
+
+        posting_records = []
+        for row in records or []:
+            values = dict(row) if isinstance(row, dict) else dict(zip(columns, row))
+            #merchant number sementara pakai institutionbranch_acq
+            # Kode lama:
+            # mid = text(values.get("institutionbranch_acq"))
+            # Keterangan: sesuai keputusan mapping Way4, Merchant Number HS/TS
+            # diambil dari kolom pan. Generator membatasi field ini menjadi 15 AN.
+            mid = text(values.get("pan"))
+            if not mid:
+                # Kode lama:
+                # logging.warning(
+                #     'Skip Way4 record without institutionbranch_acq: %s', row
+                # )
+                logging.warning('Skip Way4 record without pan: %s', row)
+                continue
+
+            period = text(values.get("period"))
+            settlement_date = text(values.get("settlementdate"), period)
+            transaction_date = (settlement_date or period)[:8].ljust(8)
+            transaction_time = text(values.get("periodtime"), "000000")
+            transaction_time = transaction_time[:6].zfill(6)
+            settlement_currency = text(
+                values.get("settlementcurrency"), "360"
+            )[:3].ljust(3)
+            transaction_currency = text(
+                values.get("transactioncurrency"), settlement_currency
+            )[:3].ljust(3)
+            pan = text(values.get("pan"))
+            rrn = text(values.get("rrn"))
+            source_regnum = text(values.get("sourceregnum"))
+            institution_acq = text(values.get("institution_acq"))
+            merchant_id = text(values.get("merchantid"), mid)
+            authorization_code = text(values.get("auth_code"))
+            response_code = text(values.get("rc"), "00")
+            if not authorization_code:
+                authorization_code = response_code
+            reversal_sequence = values.get("reversalseq")
+            reversal_flag = (
+                "F"
+                if reversal_sequence is not None and int(reversal_sequence) > 0
+                else "N"
+            )
+
+            # Kode lama memakai transactionamount, settlementcurrency, processing
+            # code 000000, waktu 000000, approval kosong, dan tidak membawa outlet.
+            # Keterangan: field berikut disesuaikan dengan mapping Way4 pada spek.
+            base_record = ReconRecordData(
+                recon_header="DH",
+                terminal_id=source_regnum[:16].ljust(16),
+                retrieval_reference_number=rrn[:12].ljust(12),
+                merchant_pan=pan[:19].ljust(19),
+                transaction_date=transaction_date,
+                transaction_time=transaction_time,
+                processing_code=processing_code(values.get("transactiontype")),
+                transaction_amount=numeric(values.get("reconamount"), 12),
+                convenience_fee=numeric(
+                    values.get("transactionchargeamount"), 9
+                ),
+                transaction_amount_currency=transaction_currency,
+                merchant_type=" " * 4,
+                merchant_criteria=" " * 3,
+                acquiring_bank_code=institution_acq[:11].ljust(11),
+                issuer_bank_code=" " * 11,
+                forwarding_institution_id=" " * 11,
+                response_code=response_code[:2].ljust(2),
+                customer_pan=pan[:28].ljust(28),
+                invoice_data=rrn[:20].ljust(20),
+                approval_code=authorization_code[:6].ljust(6),
+                message_type_indicator="0200",
+            )
+            rec = SimpleNamespace(
+                **base_record.dict(),
+                outlet_number=merchant_id,
+                batch_capture_date=period,
+                batch_currency=settlement_currency,
+                reversal_flag=reversal_flag,
+                stan=text(values.get("stan")),
+                transactiontype=text(values.get("transactiontype")),
+            )
+            posting_records.append((rec, mid))
+
+        return posting_records
+
+    def map_way4_query_result(self, records):
+        # Kode lama hasil salinan foto membentuk SimpleNamespace dari 10 kolom:
+        # columns = (
+        #     "institutionbranch_acq", "sourceregnum", "pan", "period",
+        #     "stan", "rrn", "institution_acq", "transactiontype",
+        #     "settlementdate", "settlementcurrency",
+        # )
+        # mapped_records = []
+        # for row in records:
+        #     values = dict(row) if isinstance(row, dict) else dict(zip(columns, row))
+        #     values.setdefault("merchant_pan", values.get("pan"))
+        #     values.setdefault("mid", values.get("institutionbranch_acq"))
+        #     rec = SimpleNamespace(**values)
+        #     mapped_records.append(
+        #         self.map_record_to_posting_block(rec, values.get("mid"))
+        #     )
+        # return mapped_records
+        # Keterangan: generator membutuhkan seluruh atribut ReconRecordData dan
+        # query kini mengembalikan 12 kolom. Mapping terpusat mencegah AttributeError.
+        return [
+            self.map_record_to_posting_block(rec, mid)
+            for rec, mid in self.map_way4_to_posting_records(records)
+        ]

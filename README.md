@@ -65,20 +65,7 @@ Untuk menambah dependency Python, isi `requirements.txt`, lalu jalankan kembali
 `make setup`. Untuk deployment production, gunakan database dan executor yang
 sesuai; SQLite dan `standalone` hanya ditujukan untuk development.
 
-
-> Konfigurasi ini ditujukan untuk development/learning, bukan production.
-
-Kamu bisa jawab seperti ini:
-Posting file sudah disesuaikan dengan fixed-length specification HR, HS, DT, OA, TS, dan TR. Transaksi dikelompokkan berdasarkan kombinasi MID, MPAN, dan Terminal ID. Jika kombinasi tersebut sama, transaksi digabung dalam satu batch dengan satu HS, beberapa pasangan DT–OA, lalu satu TS summary. Jika salah satunya berbeda, sistem membuat grup HS–TS baru, tetapi masih dalam satu file POSTFLIN. HR hanya satu di awal dan TR hanya satu di akhir.
-
-Kalau ditanya detail validasinya:
-- Panjang record: HR 47, HS 89, DT 147, OA 184, TS 133, TR 74.
-- Sequence record berurutan dalam satu file.
-- Voucher DT dan OA selalu sama.
-- Transaction sequence di-reset pada setiap batch.
-- TS menghitung jumlah dan total amount per grup.
-- TR menghitung jumlah dan total debit/credit seluruh file.
-- Satu source file menghasilkan satu POSTFLIN.
-- Kode lama tidak dihapus; tetap disimpan sebagai komentar.
-Tambahkan catatan ini agar transparan:
-Saat ini tabel MER_ACCEPTOR_POINT hanya menyediakan AP_ON_ID_10 dan MER_ACCEPTOR_POINT_ID. Karena belum ada kolom merchant number terpisah, Merchant Number dan Outlet Number sementara menggunakan MID yang sama. Mapping dapat dipisahkan setelah master merchant atau kolom mapping resminya tersedia.
+Terminal ID sementara menggunakan sourceregnum; foto spek tidak menunjukkan sumber terminal dengan jelas.
+Beberapa transactiontype berbentuk teks sehingga mapping processing code menggunakan asumsi.
+Nilai authorization code kosong masih fallback ke rc; perlu dipastikan apakah memang itu aturan bisnisnya.
+Balance Inquiry sementara dipetakan sebagai Purchase karena tidak ada mapping khusus pada foto.
