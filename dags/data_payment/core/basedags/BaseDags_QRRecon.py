@@ -60,6 +60,11 @@ def replication(config):
                 python_callable=DR.extract_all_zip_files,
             )
 
+            split_files_off_us = PythonOperator(
+                task_id="split_multiple_file_off_us",
+                python_callable=DR.split_multiple_files_off_us,
+            )
+
             split_files = PythonOperator(
                 task_id="split_multiple_file",
                 python_callable=DR.split_multiple_files,
@@ -80,7 +85,7 @@ def replication(config):
                 task_id="END", trigger_rule=TriggerRule.ALL_DONE
             )
 
-            start >> check_chk >> get_files >> extract_all_zip_files >> split_files >> get_way4 >> end
+            start >> check_chk >> get_files >> extract_all_zip_files >> split_files_off_us >> split_files >> get_way4 >> end
             # start >> check_chk >> get_files >> extract_all_zip_files >> split_files >> get_way4 >> put_file >> end
             # start >> check_chk >> get_files >> extract_all_zip_files >> process_on_us >> split_files >> put_file >> end
 

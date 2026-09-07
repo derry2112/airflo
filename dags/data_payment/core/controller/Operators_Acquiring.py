@@ -215,6 +215,83 @@ class Replication(object):
         except Exception as e:
             logging.error(f"Error extract_all_zip_files: error: {e}")
 
+    def split_multiple_files_off_us(self):
+        if not self.is_split:
+            logging.info('Split off-us dinonaktifkan')
+            return
+
+        date = get_current_context()["execution_date"]
+        if date is None:
+            raise ValueError('execution_date is None')
+        date += datetime.timedelta(days=self.fetch_date)
+        dateformat = date.strftime("%y/%m/%d")
+        source_directory = os.path.join(self.local_path, dateformat)
+        if not os.path.isdir(source_directory):
+            raise FileNotFoundError(source_directory)
+
+        masks = self.process_file_mask(self.file_name_mask_outgoing)
+        filenames = sorted(
+            name for name in os.listdir(source_directory)
+            if os.path.isfile(os.path.join(source_directory, name))
+            and any(fnmatch.fnmatch(name, mask) for mask in masks)
+        )
+        if not filenames:
+            raise FileNotFoundError(
+                f'Tidak ada input QR Recon di {source_directory}; mask={masks}'
+            )
+
+        mti_directory = os.path.join(self.result_local_path, dateformat)
+        pwc_directory = os.path.join(self.result_local_path_PWC, dateformat)
+        os.makedirs(mti_directory, exist_ok=True)
+        os.makedirs(pwc_directory, exist_ok=True)
+        splitter = SplitClass(getattr(self, 'kwares_db_source', None))
+
+        prepared_files = []
+        for name in filenames:
+            mti_file = os.path.join(mti_directory, name)
+            pwc_file = os.path.join(pwc_directory, name)
+            posting_files = splitter.split_rintis_qr_recon_off_us(
+                str_file_name=os.path.join(source_directory, name),
+                str_result_name=mti_file,
+                str_result_pwc=pwc_file,
+            )
+            for output in [mti_file, pwc_file, *posting_files]:
+                if not os.path.isfile(output):
+                    raise FileNotFoundError(output)
+            prepared_files.append((name, mti_file, posting_files))
+
+        hooks = []
+        try:
+            mti_hook = FTPHook(ftp_conn_id=self.destination_connection)
+            hooks.append(mti_hook)
+            pwc_hook = SFTPHook(ssh_conn_id=self.destination_connection_PWC_POST)
+            hooks.append(pwc_hook)
+            for name, mti_file, posting_files in prepared_files:
+                mti_hook.store_file(
+                    os.path.join(self.destination_path, name).replace("\\", "/"),
+                    mti_file,
+                )
+                for posting_file in posting_files:
+                    pwc_hook.store_file(
+                        os.path.join(self.target_path, os.path.basename(posting_file)).replace("\\", "/"),
+                        posting_file,
+                    )
+
+            for name, mti_file, _ in prepared_files:
+                marker = mti_file + '.chk'
+                with open(marker, 'w', encoding='utf-8'):
+                    pass
+                mti_hook.store_file(
+                    os.path.join(self.destination_path, name + '.chk').replace("\\", "/"),
+                    marker,
+                )
+        finally:
+            for hook in reversed(hooks):
+                try:
+                    hook.close_conn()
+                except Exception:
+                    logging.exception('Gagal menutup koneksi pengiriman off-us')
+
     def split_multiple_files(self):
         logging.info('source_path: %s', self.source_path)
         logging.info('pwc_path: %s', self.target_path)
@@ -320,14 +397,8 @@ class Replication(object):
                     logging.info('=============== SPLIT START ==============')
                     logging.info('start split MTI: %s', pwc_source_file)
                     logging.info('start split PWC: %s', mti_source_file)
-                    # Kode lama hanya memproses data Rintis tanpa mengambil Way4:
-                    # generated_posting_files = split_class.split_rintis_qr_recon(
-                    #     str_file_name=source_file,
-                    #     str_result_name=mti_source_file,
-                    #     str_result_pwc=pwc_source_file,
-                    # )
-                    # Keterangan: Way4 harus diambil dan dipetakan sebelum generator
-                    # dipanggil agar Rintis dan Way4 masuk ke POSTFLIN yang sama.
+
+                    # period = (date + datetime.timedelta(hours=9)).strftime("%Y%m%d")
                     period = date.strftime("%Y%m%d")
                     way4_records = self.get_way4_data(
                         period=period,
@@ -347,9 +418,6 @@ class Replication(object):
                         str_result_pwc=pwc_source_file,
                         way4_posting_records=way4_posting_records,
                     )
-                    # Kode lama:
-                    # split_class.split_rintis_qr_recon(str_file_name=source_file, str_result_name=mti_source_file, str_result_pwc=pwc_source_file)
-                    # mapped_rintis = split_class.split_rintis_qr_recon(str_file_name=source_file, str_result_name=mti_source_file, str_result_pwc=pwc_source_file)
 
                     logging.info('finish split MTI: %s', mti_source_file)
                     logging.info('finish split PWC: %s', pwc_source_file)
@@ -527,8 +595,6 @@ class Replication(object):
                 FROM sw_replicate.on_doc_transaction
                 WHERE period = %(period)s
                   AND connection_acq IN ({con_acq})
-                ORDER BY period DESC
-                LIMIT 10
             """.format(con_acq=con_acq_placeholder)
 
             logging.info('============ START GET DATA WAY4 ============')
@@ -756,7 +822,6 @@ class SplitClass():
             raise
 
     def create_posting_batch_file(self, filename, posting_records, target_split: str, header=None):
-        """Membuat satu POSTFLIN dan mengelompokkan transaksi per merchant/batch."""
         if not filename or not filename.endswith(".txt"):
             raise ValueError(f"Invalid posting filename: {filename!r}")
         if ".." in filename or "/" in filename or "\\" in filename:
@@ -1414,3 +1479,82 @@ class SplitClass():
             self.map_record_to_posting_block(rec, mid)
             for rec, mid in self.map_way4_to_posting_records(records)
         ]
+
+    def split_rintis_qr_recon_off_us(
+        self,
+        str_file_name,
+        str_result_name,
+        str_result_pwc,
+    ):
+        paths = [os.path.realpath(path) for path in (
+            str_file_name, str_result_name, str_result_pwc
+        )]
+        if len(set(paths)) != 3:
+            raise ValueError('Path input, output MTI, dan output PWC harus berbeda')
+
+        merchants = self.get_data_merchant_pwc_qr_acceptor()
+        merchants_pwcs = {
+            str(row[0]).strip() for row in merchants
+            if row and row[0] is not None and str(row[0]).strip()
+        }
+        header = None
+        trailer = None
+        mti_lines, pwc_lines, posting_records = [], [], []
+        mti_amount = pwc_amount = 0
+
+        with open(str_file_name, 'r', encoding='utf-8') as source:
+            for line_number, raw_line in enumerate(source, 1):
+                line = raw_line.rstrip('\r\n')
+                if not line:
+                    continue
+                record_type = line.split('|', 1)[0]
+                if trailer is not None:
+                    raise ValueError(f'Record setelah RT pada baris {line_number}')
+                if record_type == 'RH':
+                    if header is not None:
+                        raise ValueError('Header RH duplikat')
+                    header = ReconHeader.parse_header(line)
+                    header_line = line
+                elif header is None:
+                    raise ValueError('File harus dimulai dengan RH')
+                elif record_type == 'DH':
+                    rec = ReconRecordData.parse_recon_data_line(line)
+                    amount = int(rec.transaction_amount)
+                    mpan = str(rec.merchant_pan).strip()
+                    if mpan in merchants_pwcs:
+                        mids = self.get_merchant_by_acceptor_point(mpan)
+                        if not mids or not mids[0] or mids[0][0] is None or not str(mids[0][0]).strip():
+                            raise ValueError(f'MID PWC tidak ditemukan pada baris {line_number}')
+                        posting_records.append((rec, str(mids[0][0]).strip()))
+                        pwc_lines.append(line)
+                        pwc_amount += amount
+                    else:
+                        mti_lines.append(line)
+                        mti_amount += amount
+                elif record_type == 'RT':
+                    trailer = line.split('|')
+                    if len(trailer) != 6:
+                        raise ValueError('Trailer RT harus memiliki 6 field')
+                else:
+                    raise ValueError(f'Jenis record tidak dikenal pada baris {line_number}')
+
+        if header is None or trailer is None:
+            raise ValueError('File QR Recon harus memiliki RH dan RT')
+
+        for output, lines, amount in (
+            (str_result_name, mti_lines, mti_amount),
+            (str_result_pwc, pwc_lines, pwc_amount),
+        ):
+            output_trailer = '|'.join(trailer[:4] + [str(len(lines)), str(amount)])
+            with open(output, 'w', encoding='utf-8') as target:
+                target.write(header_line + '\n')
+                for line in lines:
+                    target.write(line + '\n')
+                target.write(output_trailer + '\n')
+
+        if not posting_records:
+            return []
+        filename = f"POSTFLIN_{self.get_timestamp_POST()}_QA.txt"
+        return [self.create_posting_batch_file(
+            filename, posting_records, target_split=str_result_pwc, header=header,
+        )]
