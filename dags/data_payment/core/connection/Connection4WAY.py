@@ -1,6 +1,24 @@
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 from airflow.providers.oracle.hooks.oracle import OracleHook
+from airflow.providers.microsoft.mssql.hooks.mssql import MsSqlHook
 import logging
+
+
+# class QrisDB(object):
+class DBConnection(object):
+    def __init__(self, mssql_conn_id='mssql_qris'):
+
+
+        self.hook = MsSqlHook(mssql_conn_id=mssql_conn_id)
+
+    def get_data(self, sql, params=None):
+        try:
+            records = self.hook.get_records(sql=sql, parameters=params)
+            logging.info('QRIS total records: %s', len(records))
+            return records
+        except Exception:
+            logging.exception('Error fetching QRIS enrichment data')
+            raise
 
 
 class Way4DB(object):

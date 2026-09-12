@@ -1,0 +1,10 @@
+services:
+  pwc-ssh-demo:
+    build: .
+    ports:
+      - "127.0.0.1:2222:22"
+    volumes:
+      - ../../data/pwrcard/home/usr/data:/pwrcard/home/usr/data:ro
+      - responses:/pwrcard/home/usr/responses
+volumes:
+  responses:

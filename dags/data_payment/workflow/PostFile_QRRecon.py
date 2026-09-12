@@ -15,7 +15,7 @@ tags.extend(TAGS)
 
 partner_rintis = {
     "workflow_name": WORKFLOW_NAME,
-    "kwares_db_source": {
+    "kwargs_db_source": {
         "type": "postgres",
         "workflow_name": WORKFLOW_NAME,
         "connection_id": "db_acq_psql",
@@ -39,7 +39,7 @@ partner_rintis = {
 config = {
     "workflow_name": "etl_OCBC_MTI_RINTIS_ProcessFileRintisQRRecon",
     "owner": "raymundus.liputre",
-    "kwares_db_source": partner_rintis.get("kwares_db_source"),
+    "kwargs_db_source": partner_rintis.get("kwargs_db_source"),
     "schedule_interval": "0 5-23/2 * * *",
     "start_date": "2023-01-01",
     "tags": tags,

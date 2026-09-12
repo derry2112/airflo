@@ -11,12 +11,13 @@ from data_payment.core.model.Models_DisputePWC import DisputeRecord, SEP, Disput
 # Keterangan: import lama dikomentari karena file dari foto bernama Models_ReconPWC.py.
 from data_payment.core.model.Models_ReconPWC import ReconHeader, ReconRecordData
 import glob, os, logging, zipfile, fnmatch, shutil, datetime, re
-from data_payment.core.connection.Connection4WAY import Way4DB, PwcDB
-
+from data_payment.core.connection.Connection4WAY import Way4DB, PwcDB, DBConnection
+# from airflow.providers.microsoft.mssql.hooks.mssql import MsSqlHook
+# from data_payment.core.connection.Connection4WAY import QrisDB
 
 class Replication(object):
-    def __init__(self, **kwares):
-        self.config = kwares
+    def __init__(self, **kwarags):
+        self.config = kwarags
         if self.config is None:
             print("Config is not defined!!!!")
         self.workflow_name = self.config.get('workflow_name')
@@ -56,8 +57,8 @@ class Replication(object):
         self.destination_table_dev_test = self.config.get('destination_table_dev_test')
 
         #query related below
-        self.kwares_db_source = self.config.get('kwares_db_source')
-        logging.info(f"config: kwares_db_source={self.kwares_db_source}")
+        self.kwargs_db_source = self.config.get('kwargs_db_source')
+        logging.info(f"config: kwargs_db_source={self.kwargs_db_source}")
 
     #custom function for to be called by dags function start
     def process_file_mask(self, outgoing_file_name = ""):
@@ -244,7 +245,7 @@ class Replication(object):
         pwc_directory = os.path.join(self.result_local_path_PWC, dateformat)
         os.makedirs(mti_directory, exist_ok=True)
         os.makedirs(pwc_directory, exist_ok=True)
-        splitter = SplitClass(getattr(self, 'kwares_db_source', None))
+        splitter = SplitClass(getattr(self, 'kwargs_db_source', None))
 
         prepared_files = []
         for name in filenames:
@@ -348,9 +349,9 @@ class Replication(object):
 
             if self.is_split:
                 logging.info('===============SPLIT & SEND FILE START===============')
-                self.kwares_db_source = getattr(self, 'kwares_db_source', None)
+                self.kwargs_db_source = getattr(self, 'kwargs_db_source', None)
 
-                split_class = SplitClass(self.kwares_db_source)
+                split_class = SplitClass(self.kwargs_db_source)
 
                 timestamp = split_class.get_timestamp_POST()
 
@@ -400,11 +401,11 @@ class Replication(object):
 
                     # period = (date + datetime.timedelta(hours=9)).strftime("%Y%m%d")
                     period = date.strftime("%Y%m%d")
-                    way4_records = self.get_way4_data(
+                    way4_records = self.get_way4_data_new(
                         period=period,
                         save_result_file=False,
                     )
-                    way4_posting_records = split_class.map_way4_to_posting_records(
+                    way4_posting_records = split_class.map_way4_to_posting_records_new(
                         way4_records
                     )
                     logging.info(
@@ -523,21 +524,10 @@ class Replication(object):
             logging.exception(e)
             raise
 
-    # Kode lama sebelum implementasi dari foto:
-    # def get_way4_data(self):
-    #     logging.info('========== START GET WAY4 DATA ==========')
-    #     split_class = SplitClass()
-    #     records = split_class.get_data_fetch_one()
-    #     logging.info('========== END GET WAY4 DATA: %s ==========', records)
-    #     return records
-    # Kode lama hasil salinan foto:
-    # def get_way4_data(self, period=None):
-    # Keterangan: parameter save_result_file ditambahkan agar proses combine dapat
-    # mengambil record tanpa membuat file Way4 terpisah sebelum POSTFLIN digabung.
     def get_way4_data(self, period=None, save_result_file=True):
         con_acq = None
         try:
-            split_class = SplitClass(self.kwares_db_source)
+            split_class = SplitClass(self.kwargs_db_source)
             timestamp = split_class.get_timestamp_POST()
             if period is None:
                 if len(timestamp) < 8 or not timestamp[:8].isdigit():
@@ -650,11 +640,134 @@ class Replication(object):
             )
             raise
 
+    def get_way4_data_new(self, period=None, save_result_file=True):
+        con_acq = None
+        try:
+            self.kwargs_db_source = getattr(self, 'kwargs_db_source', None)
+            split_class = SplitClass(self.kwargs_db_source)
+            timestamp = split_class.get_timestamp_POST()
 
+            if period is None:
+                if len(timestamp) < 8 or not timestamp[:8].isdigit():
+                    raise ValueError(
+                        f"Format timestamp POST tidak valid: {timestamp!r}"
+                    )
+
+                period = timestamp[:8]
+
+            yesterday = datetime.datetime.today() - datetime.timedelta(days=1)
+            yesterday = yesterday.strftime("%Y%m%d")
+
+            # SQL lama: and PAN like '936000281%'
+            # SQL lama: and period = %s
+            # Gunakan placeholder bernama karena params berupa dictionary.
+            sql = """
+                SELECT
+                    merchantid as merchant_id,
+                    institutionbranch_acq as terminal_id,
+                    rrn as retrieval_reference_number,
+                    period as transaction_date,
+                    periodtime as transaction_time,
+                    transactionamount as transaction_amount,
+                    transactioncurrency as transaction_amount_currency,
+                    '00000000028' as acquiring_bank_code,
+                    '00000000028' as issuer_bank_code,
+                    '' as forwarding_institution,
+                    pan as customer_pan,
+                    rc as response_code,
+                    case
+                        when TransactionType = 'CH Payment' then 'D'
+                        else 'C'
+                    end as transaction_sign,
+                    auth_code as approval_code,
+                    reversalseq,
+                    sourceregnum as srn,
+                    stan
+                FROM
+                    sw_replicate.on_doc_transaction odt
+                WHERE
+                    connection_acq = 'T'
+                    and connection_iss in ('ACQQR', 'a', 'O')
+                    and PAN like %(pan_prefix)s
+                    and transactiontype in ('CH Payment', 'Credit')
+                    and period = %(yesterday)s
+                    and (
+                        odt.rc::int = 0
+                        or (
+                            odt.rc::int in (68, 82)
+                            and exists (
+                                select 1 from sw_replicate.on_doc_transaction r
+                                where r.rrn = odt.rrn
+                                and r.transactiontype = 'Retail'
+                                and r.rc::int = 0
+                                and r.reversalseq::int = 0
+                            )
+                        )
+                    )
+                ORDER BY
+                    transaction_time DESC
+            """
+
+            logging.info('============ START GET DATA WAY4 ============')
+            logging.info('period: %s', period)
+            logging.info('sql: %s', sql)
+
+            way4 = Way4DB()
+            logging.info('connection db way4')
+
+            records = way4.get_data(
+                sql=sql,
+                # params={"yesterday": yesterday},
+                params={"yesterday": yesterday, "pan_prefix": "936000281%"},
+            )
+
+            if records is None:
+                logging.warning(
+                    'way4 get data return None | period=%s | con_acq=%s',
+                    period,
+                    con_acq,
+                )
+                records = []
+
+            if records and save_result_file:
+                os.makedirs(self.result_local_way4, exist_ok=True)
+                spek_name_pwc = f"POSTFLIN_{timestamp}.txt"
+                result_file = os.path.join(
+                    self.result_local_way4,
+                    spek_name_pwc,
+                )
+                logging.info('Save way4 result to file:%s', result_file)
+
+                with open(result_file, "w") as file:
+                    for row in records:
+                        file.write(
+                            "|".join(
+                                "" if value is None else str(value)
+                                for value in row
+                            )
+                        )
+                        file.write("\n")
+
+                logging.info(
+                    'way4 result file created:%s | total records:%s',
+                    result_file,
+                    len(records),
+                )
+
+            return records
+
+        except Exception as e:
+            logging.exception(
+                'Gagal mengambil data WAY4 | period=%s | con_acq=%s | error: %s',
+                period,
+                con_acq,
+                e,
+            )
+            raise
 class SplitClass():
-    def __init__(self, kwares_db_source):
-        self.kwares_db_source = kwares_db_source
-        logging.info(f"config: kwares_db_source={self.kwares_db_source}")
+    def __init__(self, kwargs_db_source):
+        self.kwargs_db_source = kwargs_db_source
+        logging.info(f"config: kwargs_db_source={self.kwargs_db_source}")
         
 
     def split_rintis_qr_recon(
@@ -777,7 +890,7 @@ class SplitClass():
 
     def get_data_merchant_pwc_qr_acceptor(self):
         logging.info('START Get Data merchant PWC')
-        logging.info(f"get_data: kwares_db_source={self.kwares_db_source}")
+        logging.info(f"get_data: kwargs_db_source={self.kwargs_db_source}")
         try:
             pwcDB = PwcDB()
             merchant_query = "SELECT AP_ON_ID_10 FROM MER_ACCEPTOR_POINT"
@@ -1474,6 +1587,166 @@ class SplitClass():
 
         return posting_records
 
+    def map_way4_to_posting_records_new(self, records):
+        columns = (
+            "merchant_id",
+            "terminal_id",
+            "retrieval_reference_number",
+            "transaction_date",
+            "transaction_time",
+            "transaction_amount",
+            "transaction_amount_currency",
+            "acquiring_bank_code",
+            "issuer_bank_code",
+            "forwarding_institution",
+            "customer_pan",
+            "response_code",
+            "transaction_sign",
+            "approval_code",
+            "reversalseq",
+            "srn",
+            "stan",
+        )
+
+        records = self.get_data_qris_enrichment(records, columns)
+
+        def text(value, default=""):
+            return default if value is None else str(value).strip()
+
+        def numeric(value, length):
+            if value is None:
+                return "0".zfill(length)
+
+            value_text = (
+                format(value, "f")
+                if hasattr(value, "as_tuple")
+                else str(value)
+            )
+            value_text = value_text.strip()
+
+            if "." in value_text:
+                integer, fraction = value_text.split(".", 1)
+                if fraction.strip("0"):
+                    value_text = str(int(round(float(value_text))))
+                else:
+                    value_text = integer
+
+            value_text = value_text.lstrip("+") or "0"
+            if not value_text.isdigit():
+                raise ValueError(f"Invalid Way4 numeric value: {value!r}")
+
+            return value_text[-length:].zfill(length)
+
+        def processing_code(TransactionSign, from_account, to_account):
+            from_account = text(from_account)
+            to_account = text(to_account)
+
+            if not from_account or not to_account:
+                raise ValueError(
+                    f"Invalid processing code inputs: "
+                    f"from_account={from_account!r}, to_account={to_account!r}"
+                )
+
+            if len(from_account) != 2 or not from_account.isdigit():
+                raise ValueError(
+                    f"Invalid from_account, expected 2-digit code: {from_account!r}"
+                )
+
+            if len(to_account) != 2 or not to_account.isdigit():
+                raise ValueError(
+                    f"Invalid to_account, expected 2-digit code: {to_account!r}"
+                )
+
+            ProcessingCode = "20"
+            if TransactionSign == "C":
+                ProcessingCode = "26"
+
+            return ProcessingCode + from_account + to_account
+
+        posting_records = []
+        for values in records or []:
+            mid = text(values.get("merchant_id"))
+            if not mid:
+                logging.warning("Skip Way4 record without mid: %s", values)
+                continue
+
+            period = text(values.get("transaction_date"))
+            settlement_date = text(values.get("transaction_date"))
+            transaction_date = text(values.get("transaction_date"))
+            transaction_time = text(values.get("transaction_time"), "000000")
+            transaction_time = transaction_time[:6].zfill(6)
+
+            settlement_currency = text(
+                values.get("transaction_amount_currency"), "360"
+            )[:3].ljust(3)
+            transaction_currency = text(
+                values.get("transaction_amount_currency"), settlement_currency
+            )[:3].ljust(3)
+
+            cpan = text(values.get("customer_pan"))
+            rrn = text(values.get("retrieval_reference_number"))
+            source_recnum = text(values.get("srn"))
+            institution_acq = text(values.get("acquiring_bank_code"))
+            merchant_id = text(values.get("merchant_id"), mid)
+            authorization_code = text(values.get("approval_code"))
+            response_code = text(values.get("response_code"), "00")
+            reversal_sequence = values.get("reversalseq")
+            reversal_flag = (
+                "F"
+                if reversal_sequence is not None and int(reversal_sequence) > 0
+                else "N"
+            )
+
+            terminal_id = text(values.get("terminal_id"))
+            issuer_bank_code = text(values.get("issuer_bank_code"))
+            merchant_criteria = text(values.get("merchant_criteria"))
+            from_account_type = text(values.get("from_account_type"))
+            transaction_sign = text(values.get("transaction_sign"))
+            to_account_type = text(values.get("to_account_type"))
+            mpan = text(values.get("mpan"))
+            merchant_type = text(values.get("merchant_type"))
+            invoice_number = text(values.get("invoice_number"))
+
+            base_record = ReconRecordData(
+                recon_header="DH",
+                terminal_id=terminal_id[:16].ljust(16),
+                retrieval_reference_number=rrn[:12].ljust(12),
+                merchant_pan=mpan[:19].ljust(19),
+                transaction_date=transaction_date,
+                transaction_time=transaction_time,
+                processing_code=processing_code(
+                    transaction_sign, from_account_type, to_account_type
+                ),
+                transaction_amount=numeric(values.get("transaction_amount"), 12),
+                convenience_fee=numeric(
+                    values.get("fee"), 9
+                ),
+                transaction_amount_currency=transaction_currency,
+                merchant_type=merchant_type[:4].ljust(4),
+                merchant_criteria=merchant_criteria[:3].ljust(3),
+                acquiring_bank_code=institution_acq,
+                issuer_bank_code=issuer_bank_code,
+                forwarding_institution_id=" " * 11,
+                response_code=response_code[:2].ljust(2),
+                customer_pan=cpan[:28].ljust(28),
+                invoice_data=invoice_number[:20].ljust(20),
+                approval_code=authorization_code[:6].ljust(6),
+                message_type_indicator="0200",
+            )
+
+            rec = SimpleNamespace(
+                **base_record.dict(),
+                outlet_number=merchant_id,
+                batch_capture_date=period,
+                batch_currency=transaction_currency,
+                reversal_flag=reversal_flag,
+                stan=text(values.get("stan")),
+                transactiontype=text(values.get("transactiontype")),
+            )
+            posting_records.append((rec, mid))
+
+        return posting_records
+
     def map_way4_query_result(self, records):
         return [
             self.map_record_to_posting_block(rec, mid)
@@ -1558,3 +1831,77 @@ class SplitClass():
         return [self.create_posting_batch_file(
             filename, posting_records, target_split=str_result_pwc, header=header,
         )]
+
+    def get_data_qris_enrichment(self, records, columns):
+        logging.info('START Get Data QRIS Enrichment')
+
+        if not self.kwargs_db_source:
+            logging.info(
+                "kwargs_db_source is None or empty. "
+                "Check Operator initialization in DAG."
+            )
+        
+        if not isinstance(self.kwargs_db_source, dict):
+            logging.error(
+                f"kwargs_db_source must be a dict, "
+                f"got {type(self.kwargs_db_source)}"
+            )
+            raise ValueError("kwargs_db_source must be a dictionary.")
+        
+        db = DBConnection(**self.kwargs_db_source)
+        records = [
+            dict(zip(columns, r)) if not isinstance(r, dict) else r
+            for r in records
+        ]
+        rrns = [r["retrieval_reference_number"] for r in records]
+
+        # get data qris transaction enrichment in chunks
+        qris_data = {}
+        chunk_size = 5000
+        for i in range(0, len(rrns), chunk_size):
+            batch = rrns[i:i + chunk_size]
+
+            get_qris_query = """
+                select
+                    qtlt.rrn,
+                    mt.merchant_criteria,
+                    qtlt.from_account_type,
+                    qtlt.to_account_type,
+                    qtlt.mpan,
+                    qtlt.merchant_type,
+                    qtlt.invoice_number,
+                    qtlt.fee
+                from qris_transaction_log_tt qtlt
+                join merchant_tm mt on qtlt.mid = mt.mid
+                where qtlt.rrn = any(:rrns)
+            """
+
+            logging.info(
+                f'Executing query batch {i // chunk_size + 1}, '
+                f'size: {len(batch)}'
+            )
+
+            rows = db.execute_fetch_many(get_qris_query, {"rrns": batch})
+
+            for row in rows:
+                rrn = row[0]
+                if rrn not in qris_data:
+                    qris_data[rrn] = {
+                        "merchant_criteria": row[1],
+                        "from_account_type": row[2],
+                        "to_account_type": row[3],
+                        "mpan": row[4],
+                        "merchant_type": row[5],
+                        "invoice_number": row[6],
+                        "fee": row[7],
+                    }
+
+        for r in records:
+            match = qris_data.get(r["retrieval_reference_number"])
+            if match:
+                r.update(match)
+
+        logging.info(
+            f'Finish Get Data QRIS Enrichment, total matched: {len(qris_data)}'
+        )
+        return records

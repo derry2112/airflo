@@ -11,14 +11,16 @@ services:
       # Keterangan: diperlukan oleh Connection4WAY.py untuk OracleHook.
       # Versi yang tidak tersedia dipertahankan sebagai catatan:
       # _PIP_ADDITIONAL_REQUIREMENTS: "apache-airflow-providers-oracle==3.13.2"
-      _PIP_ADDITIONAL_REQUIREMENTS: "apache-airflow-providers-oracle==3.12.1"
+      # _PIP_ADDITIONAL_REQUIREMENTS: "apache-airflow-providers-oracle==3.12.1"
+      _PIP_ADDITIONAL_REQUIREMENTS: "apache-airflow==2.10.5 apache-airflow-providers-oracle==3.12.1 apache-airflow-providers-microsoft-mssql==4.0.0"
       AIRFLOW_CONN_FTP_EBSP: "ftp://airflow:airflow@ftp:21"
       AIRFLOW_CONN_FTP_MII: "ftp://airflow:airflow@ftp:21"
       # Keterangan: dipakai SFTPHook pada proses QR Recon untuk pengiriman ke PWC.
       AIRFLOW_CONN_SFTP_PWC_POST: "sftp://airflow:airflow@sftp-pwc:22"
       # Database transaksi Way4 yang diakses oleh Connection4WAY.py.
       AIRFLOW_CONN_DB_REKON_UAT: "postgresql://airflow:airflow@postgres:5432/db_rekon_uat"
-      PYTHONPATH: "/opt/airflow/runtime"
+      # PYTHONPATH: "/opt/airflow/runtime"
+      PYTHONPATH: "/opt/airflow/runtime-compat:/opt/airflow/runtime"
     ports:
       - "8080:8080"
     volumes:
@@ -29,8 +31,8 @@ services:
       - ./data:/opt/airflow/project-data
       - ./dags:/data/airflow/nfs/dags:ro
       - ./data/artifacts:/data/airflow/nfs/artifacts
-      - ./data/pmcard:/pmcard
       - ./airflow_runtime:/opt/airflow/runtime:ro
+      - ./airflow_runtime_compat:/opt/airflow/runtime-compat:ro
     depends_on:
       - ftp
       - sftp-pwc

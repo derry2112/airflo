@@ -4,7 +4,7 @@ import logging
 def _get_way4_runtime_placeholder():
     logging.warning(
         "Runtime Airflow: get_way4_data dilewati karena kode sumber SplitClass "
-        "belum memiliki inisialisasi kwares_db_source."
+        "belum memiliki inisialisasi kwargs_db_source."
     )
     return []
 
