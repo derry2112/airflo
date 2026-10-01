@@ -840,7 +840,8 @@ class SplitClass():
                         logging.info('MID record:%s', mid_records)
                         mid = str(mid).strip()
 
-                        logging.info('[QR_RECON] MID selected | mpan:%s | type:%s | lenght:%s', mpan,mid,type(mid).__name__,len(str(mid)))
+                        # Kode lama: logging.info('[QR_RECON] MID selected | mpan:%s | type:%s | lenght:%s', mpan,mid,type(mid).__name__,len(str(mid)))
+                        logging.info('[QR_RECON][SPLIT] MID dipilih | MPAN=%s | MID=%s | tipe=%s | panjang=%s', mpan, mid, type(mid).__name__, len(mid))
 
                         filename_datetime = self.get_timestamp_POST()
 
@@ -850,7 +851,21 @@ class SplitClass():
 
                         logging.info('[QR_RECON] Calling create_posting_file | filename:%s | mpan:%s | mid:%s | target_split:%s ', filename,mpan,mid,str_result_pwc)
 
-                        pwc_posting_records.append((rec, mid))
+                        if len(mid_records[0]) < 2 or mid_records[0][1] is None:
+                            raise ValueError(f"MERCHANT_NUMBER PWC tidak ditemukan untuk MPAN [{mpan}]")
+                        merchant_number = str(mid_records[0][1]).strip()
+                        if not merchant_number.isascii() or not merchant_number.isdigit() or len(merchant_number) > 15:
+                            raise ValueError(f"MERCHANT_NUMBER PWC harus berupa angka maksimal 15 digit untuk MPAN [{mpan}]")
+                        posting_rec = SimpleNamespace(
+                            **rec.dict(),
+                            merchant_number=merchant_number,
+                        )
+                        # Kode lama: pwc_posting_records.append((rec, mid))
+                        pwc_posting_records.append((posting_rec, mid))
+                        logging.info(
+                            '[QR_RECON][SPLIT] Merchant siap untuk posting | MPAN=%s | MID(MER_ACCEPTOR_POINT_ID)=%s | MERCHANT_NUMBER=%s | panjang_merchant_number=%s | HS.outlet_number=MID | HS.merchant_number=MERCHANT_NUMBER',
+                            mpan, mid, merchant_number, len(merchant_number),
+                        )
                         file_processed_PWC.write(rec.to_line() + "\n")
                         row_count_pwc += 1
                         # record_pwc += int(rec.dispute_amount)
@@ -913,11 +928,12 @@ class SplitClass():
     def get_merchant_by_acceptor_point(self, mpan: str):
         try:
             sql = """
-                SELECT MER_ACCEPTOR_POINT_ID FROM MER_ACCEPTOR_POINT WHERE TRIM(AP_ON_ID_10) = TRIM(:mpan)
+                SELECT MER_ACCEPTOR_POINT_ID, MERCHANT_NUMBER FROM MER_ACCEPTOR_POINT WHERE TRIM(AP_ON_ID_10) = TRIM(:mpan)
             """
             mpan = str(mpan).strip()
 
-            logging.info('==== START GET DATA MID FROM MPAN ====')
+            # Kode lama: logging.info('==== START GET DATA MID FROM MPAN ====')
+            logging.info('[QR_RECON][LOOKUP] Mulai lookup MID dan MERCHANT_NUMBER | tabel=MER_ACCEPTOR_POINT | MPAN=%s', mpan)
             logging.info('sql:%s', sql)
             logging.info('mpan acceptor:%s', mpan)
 
@@ -928,10 +944,14 @@ class SplitClass():
             if records is None:
                 logging.warning('pwc get data return None')
                 records = []
-            logging.info('records result acceptor point: %s', records)
+            # Kode lama: logging.info('records result acceptor point: %s', records)
+            logging.info('[QR_RECON][LOOKUP] Selesai | MPAN=%s | jumlah_baris=%s | urutan_kolom=(MER_ACCEPTOR_POINT_ID, MERCHANT_NUMBER) | hasil=%s', mpan, len(records), records)
+            if not records:
+                logging.warning('[QR_RECON][LOOKUP] Merchant tidak ditemukan | MPAN=%s', mpan)
             return records
         except Exception as e:
-            logging.exception('Gagal ambil data MID dari PWC')
+            # Kode lama: logging.exception('Gagal ambil data MID dari PWC')
+            logging.exception('[QR_RECON][LOOKUP] Gagal mengambil MID dan MERCHANT_NUMBER dari PWC | MPAN=%s', mpan)
             raise
 
     def create_posting_batch_file(self, filename, posting_records, target_split: str, header=None):
@@ -962,7 +982,12 @@ class SplitClass():
             transaction_sequence = 0
             sequence_number += 1
             posting_lines.append(
-                self.generate_hs_record(first_rec, mid, sequence_number).rstrip("\n")
+                # Kode lama: self.generate_hs_record(first_rec, mid, sequence_number).rstrip("\n")
+                self.generate_hs_record(
+                    first_rec, mid, sequence_number,
+                    merchant_number=str(getattr(first_rec, "merchant_number", mid)),
+                    outlet_number=str(getattr(first_rec, "outlet_number", mid)),
+                ).rstrip("\n")
             )
 
             for rec in records:
@@ -1057,7 +1082,7 @@ class SplitClass():
         sequence_in_file = self.to_padded_number(8, sequence_number)
 
         institution_identification = self.pad_with_spaces("ID7339", 6)
-        file_sender = self.pad_with_spaces("360002", 6)
+        file_sender = self.pad_with_spaces("ID7339", 6)
 
         posting_lines = posting_lines or []
         dt_lines = [line for line in posting_lines if line.startswith("DT")]
@@ -1078,7 +1103,8 @@ class SplitClass():
         return result
 
     # Kode lama: def generate_hs_record(self, rec: ReconRecordData, mid: str):
-    def generate_hs_record(self, rec: ReconRecordData, mid: str, sequence_number=1):
+    # Kode lama: def generate_hs_record(self, rec: ReconRecordData, mid: str, sequence_number=1):
+    def generate_hs_record(self, rec: ReconRecordData, mid: str, sequence_number=1, *, merchant_number=None, outlet_number=None):
         logging.info('========== GENERATE HS RECORD ==============')
         logging.info('MID:%s', mid)
         logging.info('REC:%s', rec)
@@ -1094,10 +1120,27 @@ class SplitClass():
 
         # Kode lama: record_sequence = self.to_padded_number(8, new_sequence)
         record_sequence = self.to_padded_number(8, sequence_number)
-        merchant_number = self.pad_with_spaces(mid[:15], 15)
+        # Kode lama: merchant_number = self.pad_with_spaces(mid[:15], 15)
+        # Kode lama: lookup dan validasi dipindahkan ke proses split.
+        # mpan = str(rec.merchant_pan).strip()
+        # merchant_records = self.get_merchant_by_acceptor_point(mpan)
+        # if not merchant_records or len(merchant_records[0]) < 2 or merchant_records[0][1] is None:
+        #     raise ValueError(f"MERCHANT_NUMBER PWC tidak ditemukan untuk MPAN [{mpan}]")
+        # merchant_number_value = str(merchant_records[0][1]).strip()
+        # if not merchant_number_value.isascii() or not merchant_number_value.isdigit() or len(merchant_number_value) > 15:
+        #     raise ValueError(f"MERCHANT_NUMBER PWC harus berupa angka maksimal 15 digit untuk MPAN [{mpan}]")
+        # merchant_number = self.pad_with_spaces(merchant_number_value, 15)
+        # Kode lama: merchant_number_value = str(getattr(rec, "merchant_number", mid))
+        # Kode lama: merchant_number = self.pad_with_spaces(merchant_number_value[:15], 15)
+        if merchant_number is None:
+            merchant_number = mid
+        merchant_number = self.pad_with_spaces(merchant_number[:15], 15)
 
-        outlet_value = str(getattr(rec, "outlet_number", mid))
-        outlet_number = self.pad_with_spaces(outlet_value[:15], 15)
+        # Kode lama: outlet_value = str(getattr(rec, "outlet_number", mid))
+        # Kode lama: outlet_number = self.pad_with_spaces(outlet_value[:15], 15)
+        if outlet_number is None:
+            outlet_number = mid
+        outlet_number = self.pad_with_spaces(outlet_number[:15], 15)
         terminal_id = self.pad_with_spaces(rec.terminal_id[:15], 15)
         batch_number = self.to_padded_number(8, new_batch)
 
@@ -1429,7 +1472,12 @@ class SplitClass():
         if not mid:
             raise ValueError("Mid result mapping is not null")
         return (
-            self.generate_hs_record(rec, str(mid).strip())
+            # Kode lama: self.generate_hs_record(rec, str(mid).strip())
+            self.generate_hs_record(
+                rec, mid,
+                merchant_number=str(getattr(rec, "merchant_number", mid)),
+                outlet_number=str(getattr(rec, "outlet_number", mid)),
+            )
             + self.generate_dt_record(rec)
             + self.generate_oa_record(rec)
             + self.generate_ts_record(rec, str(mid).strip())
@@ -1798,7 +1846,21 @@ class SplitClass():
                         mids = self.get_merchant_by_acceptor_point(mpan)
                         if not mids or not mids[0] or mids[0][0] is None or not str(mids[0][0]).strip():
                             raise ValueError(f'MID PWC tidak ditemukan pada baris {line_number}')
-                        posting_records.append((rec, str(mids[0][0]).strip()))
+                        if len(mids[0]) < 2 or mids[0][1] is None:
+                            raise ValueError(f"MERCHANT_NUMBER PWC tidak ditemukan untuk MPAN [{mpan}]")
+                        merchant_number = str(mids[0][1]).strip()
+                        if not merchant_number.isascii() or not merchant_number.isdigit() or len(merchant_number) > 15:
+                            raise ValueError(f"MERCHANT_NUMBER PWC harus berupa angka maksimal 15 digit untuk MPAN [{mpan}]")
+                        posting_rec = SimpleNamespace(
+                            **rec.dict(),
+                            merchant_number=merchant_number,
+                        )
+                        # Kode lama: posting_records.append((rec, str(mids[0][0]).strip()))
+                        posting_records.append((posting_rec, str(mids[0][0]).strip()))
+                        logging.info(
+                            '[QR_RECON][SPLIT_OFF_US] Merchant siap untuk posting | MPAN=%s | MID(MER_ACCEPTOR_POINT_ID)=%s | MERCHANT_NUMBER=%s | panjang_merchant_number=%s | HS.outlet_number=MID | HS.merchant_number=MERCHANT_NUMBER',
+                            mpan, str(mids[0][0]).strip(), merchant_number, len(merchant_number),
+                        )
                         pwc_lines.append(line)
                         pwc_amount += amount
                     else:
