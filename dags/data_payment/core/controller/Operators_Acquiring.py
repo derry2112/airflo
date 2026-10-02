@@ -1132,15 +1132,10 @@ class SplitClass():
         # merchant_number = self.pad_with_spaces(merchant_number_value, 15)
         # Kode lama: merchant_number_value = str(getattr(rec, "merchant_number", mid))
         # Kode lama: merchant_number = self.pad_with_spaces(merchant_number_value[:15], 15)
-        if merchant_number is None:
-            merchant_number = mid
-        merchant_number = self.pad_with_spaces(merchant_number[:15], 15)
-
-        # Kode lama: outlet_value = str(getattr(rec, "outlet_number", mid))
-        # Kode lama: outlet_number = self.pad_with_spaces(outlet_value[:15], 15)
-        if outlet_number is None:
-            outlet_number = mid
-        outlet_number = self.pad_with_spaces(outlet_number[:15], 15)
+        merchant_number_value = str(getattr(rec, "merchant_number", mid))
+        merchant_number = self.pad_with_spaces(merchant_number_value[:15], 15)
+        outlet_value = str(getattr(rec, "outlet_number", mid))
+        outlet_number = self.pad_with_spaces(outlet_value[:15], 15)
         terminal_id = self.pad_with_spaces(rec.terminal_id[:15], 15)
         batch_number = self.to_padded_number(8, new_batch)
 
@@ -1260,9 +1255,12 @@ class SplitClass():
         new_batch = last_batch + 1
 
         sequence_in_file = self.to_padded_number(8, sequence_number)
-        merchant_number = self.pad_with_spaces(mid[:15], 15)
+
+        merchant_number_value = str(getattr(rec, "merchant_number", mid))
+        merchant_number = self.pad_with_spaces(merchant_number_value[:15], 15)
         outlet_value = str(getattr(rec, "outlet_number", mid))
         outlet_number = self.pad_with_spaces(outlet_value[:15], 15)
+        
         terminal_id = self.pad_with_spaces(rec.terminal_id[:15], 15)
         batch_number = self.to_padded_number(8, new_batch)
         batch_capture_date = self.pad_with_spaces(self.get_today_yyyymmdd(), 8)

@@ -15,7 +15,8 @@ INSERT INTO MER_ACCEPTOR_POINT (
 ) VALUES (
     '936000280111177646',
     '111117764535',
-    111117764535001 -- Nomor merchant dummy lokal (15 digit).
+    -- Nilai lama: 111117764535001
+    987654321098765 -- Nomor merchant dummy lokal (15 digit).
 );
 
 COMMIT;
