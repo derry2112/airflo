@@ -13,3 +13,8 @@ data/ftp-destination/
 __pycache__/
 *.py[cod]
 .pytest_cache/
+
+# Backup metadata lokal (mengandung konfigurasi dan Connections).
+backups/
+
+.env

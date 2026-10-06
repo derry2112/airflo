@@ -1,31 +1,27 @@
 services:
   airflow:
-    # Konfigurasi lama Airflow 3 dipertahankan sebagai komentar.
-    # image: apache/airflow:3.1.7-python3.12
-    # Keterangan: kode QR Recon memakai API dan context Airflow 2.
-    image: apache/airflow:2.10.5-python3.12
+    build: .
+    image: airflow-project:3.1.7
     container_name: airflow-web
     command: standalone
     environment:
       AIRFLOW__CORE__LOAD_EXAMPLES: "false"
-      # Keterangan: diperlukan oleh Connection4WAY.py untuk OracleHook.
-      # Versi yang tidak tersedia dipertahankan sebagai catatan:
-      # _PIP_ADDITIONAL_REQUIREMENTS: "apache-airflow-providers-oracle==3.13.2"
-      # _PIP_ADDITIONAL_REQUIREMENTS: "apache-airflow-providers-oracle==3.12.1"
-      _PIP_ADDITIONAL_REQUIREMENTS: "apache-airflow==2.10.5 apache-airflow-providers-oracle==3.12.1 apache-airflow-providers-microsoft-mssql==4.0.0"
+      AIRFLOW__API_AUTH__JWT_SECRET: "${AIRFLOW_JWT_SECRET:?Jalankan bash scripts/init-env.sh terlebih dahulu}"
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__AUTH_MANAGER: airflow.api_fastapi.auth.managers.simple.simple_auth_manager.SimpleAuthManager
+      AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_USERS: "admin:admin"
+      AIRFLOW__CORE__EXECUTION_API_SERVER_URL: "http://localhost:8080/execution/"
       AIRFLOW_CONN_FTP_EBSP: "ftp://airflow:airflow@ftp:21"
       AIRFLOW_CONN_FTP_MII: "ftp://airflow:airflow@ftp:21"
       # Keterangan: dipakai SFTPHook pada proses QR Recon untuk pengiriman ke PWC.
       AIRFLOW_CONN_SFTP_PWC_POST: "sftp://airflow:airflow@sftp-pwc:22"
       # Database transaksi Way4 yang diakses oleh Connection4WAY.py.
       AIRFLOW_CONN_DB_REKON_UAT: "postgresql://airflow:airflow@postgres:5432/db_rekon_uat"
-      # PYTHONPATH: "/opt/airflow/runtime"
       PYTHONPATH: "/opt/airflow/runtime-compat:/opt/airflow/runtime"
     ports:
       - "8080:8080"
     volumes:
-      # Volume Airflow 3 lama tidak dihapus.
-      # - airflow-data:/opt/airflow
+      # Gunakan metadata yang sama setelah backup dan migrasi.
       - airflow2-data:/opt/airflow
       - ./dags:/opt/airflow/dags:ro
       - ./data:/opt/airflow/project-data
@@ -38,9 +34,7 @@ services:
       - sftp-pwc
       - postgres
     healthcheck:
-      # Healthcheck Airflow 3 lama:
-      # test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/monitor/health"]
-      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/monitor/health"]
       interval: 10s
       timeout: 5s
       retries: 30

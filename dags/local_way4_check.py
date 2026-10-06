@@ -1,7 +1,7 @@
 """Explicit local simulation; does not change production source or send files."""
 from datetime import datetime
 
-from airflow.decorators import dag, task
+from airflow.sdk import dag, task
 
 
 def run_local_check():
@@ -49,7 +49,13 @@ def run_local_check():
     replication = operators.Replication(kwargs_db_source=cfg)
     splitter = operators.SplitClass(cfg)
     # Patch only within this local test process. Existing modules on disk stay intact.
-    with patch.object(operators, "DBConnection", LocalDBConnection):
+    with (
+        patch.object(operators, "DBConnection", LocalDBConnection),
+        patch.object(
+            operators.SplitClass, "get_merchant_by_acceptor_point",
+            return_value=[("DUMMYMERCHANT001", "987654321098765")],
+        ),
+    ):
         rows = replication.get_way4_data_new(save_result_file=False)
         rows = [row for row in rows if row[0] == "DUMMYMERCHANT001"]
         if len(rows) != 4:

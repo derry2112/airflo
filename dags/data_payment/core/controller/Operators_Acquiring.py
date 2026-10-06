@@ -1,7 +1,7 @@
 import sys
 import pandas as pd
 sys.path.insert(1, '/data/airflow/nfs/dags')
-from airflow.operators.python import get_current_context
+from airflow.sdk import get_current_context
 from airflow.providers.sftp.hooks.sftp import SFTPHook
 from airflow.providers.ftp.hooks.ftp import FTPHook
 # from airflow import AirflowException
@@ -10,10 +10,20 @@ from types import SimpleNamespace
 from data_payment.core.model.Models_DisputePWC import DisputeRecord, SEP, DisputeHeader
 # Keterangan: import lama dikomentari karena file dari foto bernama Models_ReconPWC.py.
 from data_payment.core.model.Models_ReconPWC import ReconHeader, ReconRecordData
+from data_payment.core.model.PostingSettings import posting_field, posting_space
 import glob, os, logging, zipfile, fnmatch, shutil, datetime, re
 from data_payment.core.connection.Connection4WAY import Way4DB, PwcDB, DBConnection
 # from airflow.providers.microsoft.mssql.hooks.mssql import MsSqlHook
 # from data_payment.core.connection.Connection4WAY import QrisDB
+
+
+def _processing_date(context):
+    """Tanggal logical untuk schedule, waktu trigger untuk run manual tanpa tanggal."""
+    date = context.get("logical_date")
+    if date is None:
+        date = context["dag_run"].run_after
+    return date
+
 
 class Replication(object):
     def __init__(self, **kwarags):
@@ -64,7 +74,7 @@ class Replication(object):
     def process_file_mask(self, outgoing_file_name = ""):
         list_file_mask = []
         context = context = get_current_context()
-        date = context["execution_date"]
+        date = _processing_date(context)
         logging.info('Execution/1 : ' + str(date))
         date = date + datetime.timedelta(hours = 9)
         logging.info('Execution/2 : ' + str(date))
@@ -86,7 +96,7 @@ class Replication(object):
             #init data
             flag = True
             # context = context = get_current_context()
-            # date = context["execution_date"]
+            # date = _processing_date(context)
             # date = date + datetime.timedelta(days=self.fetch_date)
             # date_string = date.strftime(self.format_date)
 
@@ -143,7 +153,7 @@ class Replication(object):
             logging.info('source_path=%s', self.source_path)
 
             context = get_current_context()
-            date = context["execution_date"]
+            date = _processing_date(context)
             date = date + datetime.timedelta(days=self.fetch_date)
             date_string = date.strftime("%y%m%d")
             logging.info('date_string: %s', date_string)
@@ -193,7 +203,7 @@ class Replication(object):
         try:
             logging.info('========== START ==============')
             context = get_current_context()
-            date = context["execution_date"]
+            date = _processing_date(context)
             date = date + datetime.timedelta(days=self.fetch_date)
             date_string = date.strftime("%y%m%d")
 
@@ -221,9 +231,9 @@ class Replication(object):
             logging.info('Split off-us dinonaktifkan')
             return
 
-        date = get_current_context()["execution_date"]
+        date = _processing_date(get_current_context())
         if date is None:
-            raise ValueError('execution_date is None')
+            raise ValueError('logical_date is None; trigger DAG dengan logical date')
         date += datetime.timedelta(days=self.fetch_date)
         dateformat = date.strftime("%y/%m/%d")
         source_directory = os.path.join(self.local_path, dateformat)
@@ -302,7 +312,7 @@ class Replication(object):
 
         try:
             context = get_current_context()
-            date = context["execution_date"]
+            date = _processing_date(context)
 
             if date is None:
                 raise ValueError('date is none')
@@ -985,7 +995,7 @@ class SplitClass():
                 # Kode lama: self.generate_hs_record(first_rec, mid, sequence_number).rstrip("\n")
                 self.generate_hs_record(
                     first_rec, mid, sequence_number,
-                    merchant_number=str(getattr(first_rec, "merchant_number", mid)),
+                    merchant_number=self.posting_merchant_number(first_rec),
                     outlet_number=str(getattr(first_rec, "outlet_number", mid)),
                 ).rstrip("\n")
             )
@@ -1048,7 +1058,7 @@ class SplitClass():
 
         sequence_name = self.pad_with_spaces(self.to_padded_number(8,this_sequence), 8)
 
-        bank_code_id = "ID7339"
+        bank_code_id = posting_field("HR", "institution_ref", 6)
 
         institution_ref = self.pad_with_spaces(bank_code_id, 6)
 
@@ -1063,7 +1073,7 @@ class SplitClass():
             if len(recon_date) == 8
             else self.get_timestamp_POST()
         )
-        tokenization_indicator = "C"
+        tokenization_indicator = posting_field("HR", "tokenization_indicator", 1)
 
         # Merging String
         result = record_type + sequence_name + institution_ref + file_ref + processDate + tokenization_indicator
@@ -1081,8 +1091,8 @@ class SplitClass():
 
         sequence_in_file = self.to_padded_number(8, sequence_number)
 
-        institution_identification = self.pad_with_spaces("ID7339", 6)
-        file_sender = self.pad_with_spaces("ID7339", 6)
+        institution_identification = posting_field("TR", "institution_identification", 6)
+        file_sender = posting_field("TR", "file_sender", 6)
 
         posting_lines = posting_lines or []
         dt_lines = [line for line in posting_lines if line.startswith("DT")]
@@ -1104,6 +1114,15 @@ class SplitClass():
 
     # Kode lama: def generate_hs_record(self, rec: ReconRecordData, mid: str):
     # Kode lama: def generate_hs_record(self, rec: ReconRecordData, mid: str, sequence_number=1):
+    def posting_merchant_number(self, rec, merchant_number=None):
+        value = merchant_number if merchant_number is not None else getattr(rec, "merchant_number", None)
+        if value is None:
+            raise ValueError("MERCHANT_NUMBER belum tersedia pada record posting; isi dari lookup merchant PWC")
+        value = str(value).strip()
+        if not value or not value.isascii() or not value.isdigit() or len(value) > 15:
+            raise ValueError(f"MERCHANT_NUMBER harus angka maksimal 15 digit: {value!r}")
+        return value
+
     def generate_hs_record(self, rec: ReconRecordData, mid: str, sequence_number=1, *, merchant_number=None, outlet_number=None):
         logging.info('========== GENERATE HS RECORD ==============')
         logging.info('MID:%s', mid)
@@ -1120,20 +1139,8 @@ class SplitClass():
 
         # Kode lama: record_sequence = self.to_padded_number(8, new_sequence)
         record_sequence = self.to_padded_number(8, sequence_number)
-        # Kode lama: merchant_number = self.pad_with_spaces(mid[:15], 15)
-        # Kode lama: lookup dan validasi dipindahkan ke proses split.
-        # mpan = str(rec.merchant_pan).strip()
-        # merchant_records = self.get_merchant_by_acceptor_point(mpan)
-        # if not merchant_records or len(merchant_records[0]) < 2 or merchant_records[0][1] is None:
-        #     raise ValueError(f"MERCHANT_NUMBER PWC tidak ditemukan untuk MPAN [{mpan}]")
-        # merchant_number_value = str(merchant_records[0][1]).strip()
-        # if not merchant_number_value.isascii() or not merchant_number_value.isdigit() or len(merchant_number_value) > 15:
-        #     raise ValueError(f"MERCHANT_NUMBER PWC harus berupa angka maksimal 15 digit untuk MPAN [{mpan}]")
-        # merchant_number = self.pad_with_spaces(merchant_number_value, 15)
-        # Kode lama: merchant_number_value = str(getattr(rec, "merchant_number", mid))
-        # Kode lama: merchant_number = self.pad_with_spaces(merchant_number_value[:15], 15)
-        merchant_number_value = str(getattr(rec, "merchant_number", mid))
-        merchant_number = self.pad_with_spaces(merchant_number_value[:15], 15)
+        merchant_number_value = self.posting_merchant_number(rec, merchant_number)
+        merchant_number = self.pad_with_spaces(merchant_number_value, 15)
         outlet_value = str(getattr(rec, "outlet_number", mid))
         outlet_number = self.pad_with_spaces(outlet_value[:15], 15)
         terminal_id = self.pad_with_spaces(rec.terminal_id[:15], 15)
@@ -1151,7 +1158,7 @@ class SplitClass():
             getattr(rec, "batch_currency", rec.transaction_amount_currency)
         )
         batch_currency = self.pad_with_spaces(batch_currency_value[:3], 3)
-        batch_type = "P"
+        batch_type = posting_field("HS", "batch_type", 1)
 
         # Merging String
         result = record_type + record_sequence + merchant_number + outlet_number + terminal_id + batch_number + batch_capture_date + batch_datetime + batch_currency + batch_type
@@ -1185,27 +1192,27 @@ class SplitClass():
 
         record_sequence_in_file = self.to_padded_number(8, sequence_number)
         transaction_sequence_in_batch = self.to_padded_number(7, transaction_sequence)
-        service_type = "0"
+        service_type = posting_field("DT", "service_type", 1)
         voucher_number = self.pad_with_spaces(voucher_generated[:8], 8)
         card_number = self.pad_with_spaces(rec.customer_pan[:22], 22)
-        expiry_date = self.generate_spaces_int(6)
+        expiry_date = posting_field("DT", "expiry_date", 6)
         processing_date = self.pad_with_spaces(rec.processing_code[:6], 6)
         reversal_flag = str(getattr(rec, "reversal_flag", "N"))[:1]
-        authorization_flag = "A"
-        post_date = self.pad_with_spaces("100001154110"[:12], 12)
+        authorization_flag = posting_field("DT", "authorization_flag", 1)
+        post_date = posting_field("DT", "pos_data", 12)
         # Kode lama: post_entry_mode = self.pad_with_spaces("A2", 4)
-        post_entry_mode = self.pad_with_spaces("012"[:4], 4)
-        post_condition_code = self.pad_with_spaces("00"[:2], 2)
+        post_entry_mode = posting_field("DT", "pos_entry_mode", 4)
+        post_condition_code = posting_field("DT", "pos_condition_code", 2)
         transaction_datetime = self.pad_with_spaces(f"{rec.transaction_date}{rec.transaction_time}", 14)
         transaction_amount = self.to_fixed_numeric(rec.transaction_amount[:18], 18)
         transaction_sign = "D" if rec.processing_code[:2] in {"20", "29"} else "C"
         transaction_currency = self.pad_with_spaces(rec.transaction_amount_currency[:3], 3)
-        currency_exponent = "1"
-        reversal_reason_code = self.generate_spaces_int(2)
-        replacement_amounts = self.generate_spaces_int(18)
+        currency_exponent = posting_field("DT", "currency_exponent", 1)
+        reversal_reason_code = posting_field("DT", "reversal_reason_code", 2)
+        replacement_amounts = posting_field("DT", "replacement_amounts", 18)
         authorization_code = self.pad_with_spaces(rec.approval_code[:6], 6)
-        service_code = self.generate_spaces_int(3)
-        single_message_indicator = "Y"
+        service_code = posting_field("DT", "service_code", 3)
+        single_message_indicator = posting_field("DT", "single_message_indicator", 1)
 
         # Merging String
         result = record_type + record_sequence_in_file + transaction_sequence_in_batch + service_type + voucher_number + card_number + expiry_date + processing_date + reversal_flag + authorization_flag + post_date + post_entry_mode + post_condition_code + transaction_datetime + transaction_amount + transaction_sign + transaction_currency + currency_exponent + reversal_reason_code + replacement_amounts + authorization_code + service_code + single_message_indicator
@@ -1224,18 +1231,18 @@ class SplitClass():
 
         record_sequence = sequence
         voucher_number = self.to_padded_number(8, voucher_sequence)
-        tip_amount = self.generate_spaces_int(18)
-        cashback_amount = self.generate_spaces_int(18)
+        tip_amount = posting_field("OA", "tip_amount", 18)
+        cashback_amount = posting_field("OA", "cashback_amount", 18)
         fee = self.to_fixed_numeric(rec.convenience_fee[:18], 18)
-        surcharge_fee = self.generate_spaces_int(18)
+        surcharge_fee = posting_field("OA", "surcharge_fee", 18)
         billing_amount = self.to_fixed_numeric(rec.transaction_amount[:18], 18)
         billing_currency = self.pad_with_spaces(rec.transaction_amount_currency[:3], 3)
-        conversion_rate = self.generate_spaces_int(12)
-        rate_exponent = self.generate_spaces_int(2)
-        rate_date = self.generate_spaces_int(14)
-        reversed_for_future_use = self.generate_spaces_int(9)
+        conversion_rate = posting_field("OA", "conversion_rate", 12)
+        rate_exponent = posting_field("OA", "rate_exponent", 2)
+        rate_date = posting_field("OA", "rate_date", 14)
+        reversed_for_future_use = posting_field("OA", "reserved_for_future_use", 9)
         external_ref_id = self.pad_with_spaces(rec.invoice_data[:23], 23)
-        dcc_indicator = self.generate_spaces_int(1)
+        dcc_indicator = posting_field("OA", "dcc_indicator", 1)
         reversed_for_future_use2 = self.pad_with_spaces(rec.retrieval_reference_number[:12], 12)
         result = record_type + record_sequence + voucher_number + tip_amount + cashback_amount + fee + surcharge_fee + billing_amount + billing_currency + conversion_rate + rate_exponent + rate_date + reversed_for_future_use + external_ref_id + dcc_indicator + reversed_for_future_use2
 
@@ -1256,8 +1263,8 @@ class SplitClass():
 
         sequence_in_file = self.to_padded_number(8, sequence_number)
 
-        merchant_number_value = str(getattr(rec, "merchant_number", mid))
-        merchant_number = self.pad_with_spaces(merchant_number_value[:15], 15)
+        merchant_number_value = self.posting_merchant_number(rec)
+        merchant_number = self.pad_with_spaces(merchant_number_value, 15)
         outlet_value = str(getattr(rec, "outlet_number", mid))
         outlet_number = self.pad_with_spaces(outlet_value[:15], 15)
         
@@ -1325,7 +1332,7 @@ class SplitClass():
         spaces_count = int(length) if length.isdigit() else len(length)
 
         # Kode lama: return " " * int(length)
-        return " " * spaces_count
+        return posting_space() * spaces_count
 
     def generate_spaces_int(self, length: int):
         # Validate input type
@@ -1337,7 +1344,7 @@ class SplitClass():
             raise ValueError("Length cannot be negative.")
 
         # Generate spaces
-        return " " * length
+        return posting_space() * length
 
     def pad_with_spaces(self, text: str, length: int):
         # type data validation
@@ -1354,7 +1361,7 @@ class SplitClass():
 
         # count total space needed
         spaces_needed = length - len(text)
-        return text + (" " * spaces_needed)
+        return text + (posting_space() * spaces_needed)
 
     def to_padded_number(self, length: int, number: int):
         try:
@@ -1473,7 +1480,7 @@ class SplitClass():
             # Kode lama: self.generate_hs_record(rec, str(mid).strip())
             self.generate_hs_record(
                 rec, mid,
-                merchant_number=str(getattr(rec, "merchant_number", mid)),
+                merchant_number=self.posting_merchant_number(rec),
                 outlet_number=str(getattr(rec, "outlet_number", mid)),
             )
             + self.generate_dt_record(rec)
@@ -1780,8 +1787,15 @@ class SplitClass():
                 message_type_indicator="0200",
             )
 
+            merchant_rows = self.get_merchant_by_acceptor_point(mpan)
+            if not merchant_rows or len(merchant_rows[0]) < 2 or merchant_rows[0][1] is None:
+                raise ValueError(f"MERCHANT_NUMBER PWC tidak ditemukan untuk MPAN [{mpan}]")
+            merchant_number = self.posting_merchant_number(
+                base_record, merchant_rows[0][1]
+            )
             rec = SimpleNamespace(
                 **base_record.dict(),
+                merchant_number=merchant_number,
                 outlet_number=merchant_id,
                 batch_capture_date=period,
                 batch_currency=transaction_currency,

@@ -43,7 +43,7 @@ CONSTRAINT_URL="https://raw.githubusercontent.com/apache/airflow/constraints-${A
 "${PROJECT_DIR}/.venv/bin/pip" install "apache-airflow==${AIRFLOW_VERSION}" --constraint "${CONSTRAINT_URL}"
 
 if grep -Eq '^[[:space:]]*[^#[:space:]]' "${PROJECT_DIR}/requirements.txt"; then
-  "${PROJECT_DIR}/.venv/bin/pip" install -r "${PROJECT_DIR}/requirements.txt"
+  "${PROJECT_DIR}/.venv/bin/pip" install "apache-airflow==${AIRFLOW_VERSION}" -r "${PROJECT_DIR}/requirements.txt" --constraint "${CONSTRAINT_URL}"
 fi
 
 AIRFLOW_HOME="${PROJECT_DIR}" "${PROJECT_DIR}/.venv/bin/airflow" db migrate

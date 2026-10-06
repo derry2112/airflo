@@ -1,3 +1,7 @@
-# Tambahkan provider atau library Python khusus DAG di sini.
-# Contoh: apache-airflow-providers-postgres==6.5.0
-
+# Versi provider mengikuti constraints Airflow pada Dockerfile/scripts/setup.sh.
+apache-airflow-providers-standard
+apache-airflow-providers-postgres
+apache-airflow-providers-oracle
+apache-airflow-providers-microsoft-mssql
+apache-airflow-providers-ftp
+apache-airflow-providers-sftp

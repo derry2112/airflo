@@ -1,4 +1,4 @@
-"""Opt-in local compatibility layer; enabled only by compose.compat.yaml."""
+"""Local compatibility layer enabled by compose.yaml."""
 import functools
 import runpy
 from unittest.mock import patch

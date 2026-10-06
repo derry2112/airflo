@@ -1,8 +1,7 @@
-from airflow import DAG, Dataset
-from airflow.operators.python import PythonOperator, ShortCircuitOperator
-from airflow.operators.empty import EmptyOperator
-from airflow.utils.task_group import TaskGroup
-from airflow.utils.trigger_rule import TriggerRule
+from airflow.sdk import DAG, TaskGroup
+from airflow.providers.standard.operators.python import PythonOperator, ShortCircuitOperator
+from airflow.providers.standard.operators.empty import EmptyOperator
+from airflow.task.trigger_rule import TriggerRule
 from datetime import datetime, timedelta, timezone
 import sys
 
@@ -23,15 +22,13 @@ def replication(config):
         "retries": 0,
         "retry_delay": timedelta(minutes=1),
         "priority_weight": 10,
-        "sla": timedelta(hours=1),
         "execution_timeout": timedelta(minutes=10),
-        "timezone": "Asia/Jakarta",
     }
 
     dag = DAG(
         dag_id=workflow_name,
         default_args=default_args,
-        start_date=datetime.strptime(config.get("start_date"), "%Y-%m-%d").astimezone(tz),
+        start_date=datetime.strptime(config.get("start_date"), "%Y-%m-%d").replace(tzinfo=tz),
         schedule=schedule_interval,
         dagrun_timeout=timedelta(minutes=10),
         catchup=False,

@@ -1,5 +1,4 @@
-# """Contoh pipeline ETL sederhana menggunakan TaskFlow API Airflow 3."""
-"""Contoh pipeline ETL sederhana menggunakan TaskFlow API Airflow 2."""
+"""Contoh pipeline ETL sederhana menggunakan TaskFlow API Airflow 3."""
 
 from __future__ import annotations
 
@@ -8,8 +7,7 @@ import os
 from datetime import datetime, timedelta
 from pathlib import Path
 
-# from airflow.sdk import dag, task
-from airflow.decorators import dag, task
+from airflow.sdk import dag, task
 
 
 AIRFLOW_HOME = Path(os.environ.get("AIRFLOW_HOME", Path(__file__).parents[1]))

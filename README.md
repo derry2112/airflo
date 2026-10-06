@@ -1,9 +1,39 @@
 # Airflow QR Recon — panduan lingkungan lokal
 
-Panduan ini mengikuti `compose.yaml` utama: Airflow **2.10.5 / Python 3.12**,
+Panduan ini mengikuti `compose.yaml` utama: Airflow **3.1.7 / Python 3.12**,
 PostgreSQL, Oracle, FTP, dan SFTP lokal. Adapter kompatibilitas sudah digabung
 ke Compose utama; tidak perlu `compose.compat.yaml`.
 Server SSH PWC dummy menggunakan Compose terpisah di `scripts/pwc-ssh-demo/`.
+
+## Upgrade dari Airflow 2
+
+Referensi: [panduan upgrade resmi Airflow 3.1.7](https://airflow.apache.org/docs/apache-airflow/3.1.7/installation/upgrading_to_airflow3.html).
+
+Image lokal dibangun dari `apache/airflow:3.1.7-python3.12`; seluruh provider
+mengikuti constraints resmi versi yang sama. Volume `airflow2-data` tetap digunakan
+agar history dan Connections tersedia setelah migrasi. Volume `airflow-data` lama
+juga tetap disimpan.
+
+Sebelum upgrade environment yang sudah berisi data, hentikan Airflow dan backup:
+
+```bash
+bash scripts/init-env.sh
+docker compose stop airflow
+mkdir -p backups
+docker run --rm --user 0 --entrypoint tar -v airflow-project_airflow2-data:/source:ro -v "$PWD/backups:/backup" apache/airflow:2.10.5-python3.12 -czf /backup/airflow2-before-upgrade.tgz -C /source .
+docker compose build airflow
+docker compose run --rm --no-deps airflow airflow config update --fix
+docker compose run --rm --no-deps airflow airflow db migrate
+docker compose up -d
+```
+
+Nama volume mengikuti nama project Compose; sesuaikan bila project name berbeda.
+Airflow 3 menggunakan Simple Auth Manager untuk standalone. Password admin berada
+di `simple_auth_manager_passwords.json.generated`; password UI Airflow 2 tidak berlaku.
+JWT secret acak dibuat oleh `scripts/init-env.sh` di `.env` (diabaikan Git).
+DAG memakai `logical_date` (fallback `dag_run.run_after` untuk trigger manual),
+operator dari standard provider, dan Task SDK.
+SLA lama dihapus karena tidak didukung Airflow 3; `execution_timeout` tetap aktif.
 
 ## 1. Prasyarat dan startup
 
@@ -13,24 +43,25 @@ Jalankan seluruh perintah berikut dari root repository:
 
 ```bash
 cd /home/enigma_camp/myproject/airflow-project
+bash scripts/init-env.sh
 mkdir -p data/pwrcard/home/usr/data data/ACQ_MTI/ClearingRintisQRIS
 docker compose config --quiet
-docker compose up -d
+docker compose up -d --build
 docker compose ps
 docker compose logs --tail 50 airflow
 ```
 
-Tunggu startup dan pemasangan provider selesai. Periksa kesehatan Airflow:
+Tunggu startup selesai; provider sudah dipasang saat build image. Periksa kesehatan Airflow:
 
 ```bash
-docker compose exec -T airflow curl -fsS http://localhost:8080/health
+docker compose exec -T airflow curl -fsS http://localhost:8080/api/v2/monitor/health
 ```
 
 Buka [Airflow](http://localhost:8080). Akun standalone biasanya `admin`;
 lihat kredensial yang dibuat pada log startup atau file lokal container:
 
 ```bash
-docker compose exec -T airflow cat /opt/airflow/standalone_admin_password.txt
+docker compose exec -T airflow cat /opt/airflow/simple_auth_manager_passwords.json.generated
 ```
 
 Gunakan kredensial dari environment yang sedang berjalan, bukan catatan lama.
@@ -82,10 +113,9 @@ docker compose exec -T postgres psql -v ON_ERROR_STOP=1 -U airflow -d postgres <
 | `05_qris_enrichment_local.sql` | Membuat DB `db_acq_psql`, tabel `merchant_tm` dan `qris_transaction_log_tt` |
 
 Seed 04 mencakup CH Payment/Credit RC 0 serta RC 68/82 dengan Retail pendukung:
-query menghasilkan 4 transaksi per tanggal. Script 05 berisi 8 RRN tetap untuk
-**11–12 September 2026**. Jika menguji tanggal lain, siapkan enrichment dengan RRN
-yang sama dengan seed Way4 pada tanggal tersebut. Menjalankan ulang script 05
-saja tidak menggeser tanggal RRN.
+query menghasilkan 4 transaksi per tanggal. Script 05 menyediakan RRN historis **11–12 September 2026** serta enrichment
+untuk hari ini dan kemarin (Asia/Jakarta), sesuai seed Way4 04. Jalankan ulang
+script 04 dan 05 saat menguji pada hari lain.
 
 Oracle menginisialisasi `oracle/init/01_powercard.sql` pada database baru.
 Lookup merchant Rintis membutuhkan MPAN yang cocok dengan `MER_ACCEPTOR_POINT`;
@@ -127,8 +157,8 @@ menyediakan `execute_fetch_many()`, dan menerjemahkan `:rrns` menjadi `%(rrns)s`
 Adapter mengikuti konfigurasi `type=postgres` dan Connection ID `db_acq_psql`.
 Ia tidak menghubungkan PostgreSQL ke MsSqlHook dan tidak membutuhkan `mssql_qris`.
 
-Adapter membungkus callable task pada DAG QR Recon di proses lokal; file controller,
-connection, basedag, dan workflow tidak diubah. Kebijakan runtime lama tetap dipakai:
+Adapter membungkus callable task pada DAG QR Recon di proses lokal. Adapter
+database tetap dipakai bersama API DAG Airflow 3. Kebijakan runtime lama tetap dipakai:
 **task `get_way4_data` terpisah masih berupa placeholder yang mengembalikan `[]`.**
 Pemanggilan `get_way4_data_new()` dari proses split adalah jalur berbeda dan tetap
 berjalan. Status DAG sukses tidak membuktikan seluruh jalur produksi sudah diuji.
@@ -164,6 +194,25 @@ DAG utama melakukan upload ke FTP/SFTP yang dikonfigurasi. Task `check_chk` dapa
 melewati proses jika marker `.chk` sudah ditemukan. Periksa marker dan tanggal
 sebelum menganggap task yang skipped sebagai error. Script posting Bash/SSH belum
 otomatis dirangkai sebagai task pada DAG utama.
+
+## Setting global generator POSTFLIN
+
+Edit [`PostingSettings.py`](dags/data_payment/core/model/PostingSettings.py),
+lalu trigger run baru. File hasil sebelumnya tidak berubah.
+
+- `SPACE`: satu karakter padding untuk field teks dan field kosong (default spasi).
+- `MERCHANT_OUTLET_SPACES = 1`: tambahan satu spasi antara merchant number dan
+  outlet number pada HS/TS. Panjang HS menjadi 90 dan TS 134; nilai 0 mengembalikan
+  layout sebelumnya (89/133).
+- `POSTING_FIELDS`: nilai tetap per record HR/HS/DT/OA/TR; `""` menghasilkan field kosong.
+- Contoh: `POSTING_FIELDS["DT"]["pos_entry_mode"] = "012"`,
+  `POSTING_FIELDS["OA"]["dcc_indicator"] = "N"`.
+
+Nilai otomatis di-padding kanan hingga panjang field yang ditetapkan generator.
+Nilai terlalu panjang, non-ASCII, atau mengandung newline akan ditolak. Panjang
+record divalidasi sesuai jumlah spasi tambahan; zero-padding angka tetap sama. Perubahan nilai
+harus sesuai spesifikasi penerima; `SPACE = " "` menghasilkan padding spasi.
+Tanggal, nominal, merchant, dan processing code tetap diambil dari mapping transaksi.
 
 ## 7. Menjalankan Bash lokal
 
@@ -227,7 +276,7 @@ docker compose exec -T postgres psql -U airflow -d db_acq_psql -c 'SELECT count(
 
 | Gejala | Pemeriksaan / tindakan lokal |
 |---|---|
-| `airflow.sdk` tidak ditemukan | Kode contoh Airflow 3 tidak cocok dengan runtime 2.10.5; contoh proyek kini memakai `airflow.decorators` |
+| `airflow.sdk` tidak ditemukan | Build ulang image Airflow 3: `docker compose up -d --build` |
 | Provider MSSQL tidak ditemukan | Pastikan startup pip berhasil; dependency MSSQL sudah ada pada Compose utama |
 | `unexpected keyword argument type` | Pastikan runtime-compat aktif dan jalankan ulang task melalui DAG QR Recon |
 | `db_acq_psql isn't defined` | Tambahkan Connection sesuai bagian 4 |
