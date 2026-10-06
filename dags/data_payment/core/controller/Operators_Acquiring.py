@@ -21,40 +21,6 @@ def _processing_date(context):
     return date
 
 
-class PostingSettings:
-    def __init__(self, settings=None):
-        self.settings = deepcopy(settings or {})
-
-    def posting_space(self):
-        value = self.settings.get("space", " ")
-        if not isinstance(value, str) or len(value) != 1 or not value.isascii() or not value.isprintable():
-            raise ValueError("posting_settings.space harus satu karakter ASCII yang dapat dicetak")
-        return value
-
-    def posting_field(self, record, name, length):
-        try:
-            value = self.settings["fields"][record][name]
-        except KeyError as exc:
-            raise ValueError(f"Setting {record}.{name} belum diisi pada posting_settings.fields") from exc
-        if not isinstance(value, str) or not value.isascii() or (value and not value.isprintable()):
-            raise ValueError(f"Setting {record}.{name} harus string ASCII satu baris")
-        if len(value) > length:
-            raise ValueError(f"Setting {record}.{name} melebihi panjang field {length}")
-        return value.ljust(length, self.posting_space())
-
-    def _spaces(self, name):
-        count = self.settings.get(name, 0)
-        if type(count) is not int or count < 0:
-            raise ValueError(f"posting_settings.{name} harus integer >= 0")
-        return self.posting_space() * count
-
-    def merchant_outlet_space(self):
-        return self._spaces("merchant_outlet_spaces")
-
-    def hs_sequence_space(self):
-        return self._spaces("hs_sequence_spaces")
-
-
 class Replication(object):
     def __init__(self, **kwarags):
         self.config = kwarags
@@ -374,8 +340,6 @@ class Replication(object):
 
                 split_class = SplitClass(self.kwargs_db_source, self.posting_settings)
 
-                timestamp = split_class.get_timestamp_POST()
-
                 result_local_path_PWC = os.path.join(self.result_local_path_PWC, dateformat)
                 result_local_path = os.path.join(self.result_local_path, dateformat)
                 os.makedirs(result_local_path, exist_ok=True)
@@ -448,28 +412,10 @@ class Replication(object):
                         logging.info('Deleted raw QR_RECON file: %s', qr_file)
                     logging.info('============= SEND START ==============')
 
-                    logging.info('Creating .chk file mti')
+                    remote_file_mti = os.path.join(self.destination_path, filename).replace("\\", "/")
+                    destination_hook_mti.store_file(remote_file_mti, mti_source_file)
+                    logging.info('sukses upload hasil split MTI %s -> %s', mti_source_file, remote_file_mti)
 
-                    split_name_mti = f"POSTFLIN_{timestamp}"
-                    remote_file_mti = f"POSTFLIN_{timestamp}.txt"
-
-                    chk_name_mti = split_name_mti + '.chk'
-                    chk_file_mti = os.path.join(result_local_path,chk_name_mti)
-                    logging.info('chk_name_mti:%s', chk_name_mti)
-                    logging.info('chk_file_mti:%s', chk_file_mti)
-                    with open(chk_file_mti, 'w') as f:
-                        pass
-
-                    remote_file_mti = os.path.join(self.destination_path, chk_name_mti).replace("\\", "/")
-                    destination_hook_mti.store_file(
-                        remote_file_mti,
-                        chk_file_mti,
-                    )
-                    logging.info(
-                        'sukses upload chk hasil split Rintis %s -> %s',
-                        chk_file_mti,
-                        remote_file_mti,
-                    )
                     print('========= BEFORE PWC STORE =========', flush=True)
                     for generated_posting_file in generated_posting_files:
                         remote_file_pwc = os.path.join(
@@ -493,12 +439,18 @@ class Replication(object):
                         )
 
 
+                    chk_file_mti = mti_source_file + '.chk'
+                    remote_chk_mti = remote_file_mti + '.chk'
+                    with open(chk_file_mti, 'w', encoding='utf-8'):
+                        pass
+                    destination_hook_mti.store_file(remote_chk_mti, chk_file_mti)
+                    logging.info('sukses upload marker MTI %s -> %s', chk_file_mti, remote_chk_mti)
+
                     destination_hook_pwc.close_conn()
                     print('========= AFTER PWC STORE =========', flush=True)
 
                     logging.info('============= SEND END ==============')
 
-                    logging.info('sukses upload %s -> %s', remote_file_mti+chk_name_mti, remote_file_mti)
 
                     logging.info('============= SEND & SPLIT END ==============')
             else:
@@ -748,13 +700,38 @@ class Replication(object):
 class SplitClass():
     def __init__(self, kwargs_db_source, posting_settings=None):
         self.kwargs_db_source = kwargs_db_source
-        settings = PostingSettings(posting_settings)
-        self.posting_space = settings.posting_space
-        self.posting_field = settings.posting_field
-        self.merchant_outlet_space = settings.merchant_outlet_space
-        self.hs_sequence_space = settings.hs_sequence_space
+        self.settings = deepcopy(posting_settings or {})
         logging.info(f"config: kwargs_db_source={self.kwargs_db_source}")
         
+
+    def posting_space(self):
+        value = self.settings.get("space", " ")
+        if not isinstance(value, str) or len(value) != 1 or not value.isascii() or not value.isprintable():
+            raise ValueError("posting_settings.space harus satu karakter ASCII yang dapat dicetak")
+        return value
+
+    def posting_field(self, record, name, length):
+        try:
+            value = self.settings["fields"][record][name]
+        except KeyError as exc:
+            raise ValueError(f"Setting {record}.{name} belum diisi pada posting_settings.fields") from exc
+        if not isinstance(value, str) or not value.isascii() or (value and not value.isprintable()):
+            raise ValueError(f"Setting {record}.{name} harus string ASCII satu baris")
+        if len(value) > length:
+            raise ValueError(f"Setting {record}.{name} melebihi panjang field {length}")
+        return value.ljust(length, self.posting_space())
+
+    def _spaces(self, name):
+        count = self.settings.get(name, 0)
+        if type(count) is not int or count < 0:
+            raise ValueError(f"posting_settings.{name} harus integer >= 0")
+        return self.posting_space() * count
+
+    def merchant_outlet_space(self):
+        return self._spaces("merchant_outlet_spaces")
+
+    def hs_sequence_space(self):
+        return self._spaces("hs_sequence_spaces")
 
     def split_rintis_qr_recon(
         self,

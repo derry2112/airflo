@@ -15,13 +15,10 @@ tags.extend(TAGS)
 
 SPACE = " "
 
-# Spasi tambahan antara merchant_number (15) dan outlet_number (15) pada HS/TS.
 MERCHANT_OUTLET_SPACES = 1
 
-# Spasi setelah record_sequence pada HS dan TS.
 HS_SEQUENCE_SPACES = 1
 
-# Field kosong dapat diberi nilai; generator menambahkan SPACE hingga panjang field.
 POSTING_FIELDS = {
     "HR": {"institution_ref": "ID7339", "tokenization_indicator": "C"},
     "HS": {"batch_type": "P"},
