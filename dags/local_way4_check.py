@@ -44,10 +44,12 @@ def run_local_check():
                 parameters=params,
             )
 
+    from data_payment.workflow.PostFile_QRRecon import config as workflow_config
+    posting_settings = workflow_config["posting_settings"]
     cfg = {"type": "postgres", "connection_id": "db_rekon_uat"}
     output_dir = Path(tempfile.mkdtemp(prefix="way4-local-", dir="/opt/airflow"))
     replication = operators.Replication(kwargs_db_source=cfg)
-    splitter = operators.SplitClass(cfg)
+    splitter = operators.SplitClass(cfg, posting_settings)
     # Patch only within this local test process. Existing modules on disk stay intact.
     with (
         patch.object(operators, "DBConnection", LocalDBConnection),

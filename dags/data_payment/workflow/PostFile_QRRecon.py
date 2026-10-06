@@ -13,6 +13,45 @@ TAGS = FILE_PATH.split("/")[-3:-1]
 tags = ["data_payment", "acquiring", "splitfile"]
 tags.extend(TAGS)
 
+SPACE = " "
+
+# Spasi tambahan antara merchant_number (15) dan outlet_number (15) pada HS/TS.
+MERCHANT_OUTLET_SPACES = 1
+
+# Spasi setelah record_sequence pada HS dan TS.
+HS_SEQUENCE_SPACES = 1
+
+# Field kosong dapat diberi nilai; generator menambahkan SPACE hingga panjang field.
+POSTING_FIELDS = {
+    "HR": {"institution_ref": "ID7339", "tokenization_indicator": "C"},
+    "HS": {"batch_type": "P"},
+    "DT": {
+        "service_type": "0",
+        "expiry_date": "",
+        "authorization_flag": "A",
+        "pos_data": "100001154110",
+        "pos_entry_mode": "012",
+        "pos_condition_code": "00",
+        "currency_exponent": "1",
+        "reversal_reason_code": "",
+        "replacement_amounts": "",
+        "service_code": "",
+        "single_message_indicator": "Y",
+    },
+    "OA": {
+        "tip_amount": "",
+        "cashback_amount": "",
+        "surcharge_fee": "",
+        "conversion_rate": "",
+        "rate_exponent": "",
+        "rate_date": "",
+        "reserved_for_future_use": "",
+        "dcc_indicator": "",
+    },
+    "TR": {"institution_identification": "ID7339", "file_sender": "ID7339"},
+}
+
+
 partner_rintis = {
     "workflow_name": WORKFLOW_NAME,
     "kwargs_db_source": {
@@ -37,6 +76,12 @@ partner_rintis = {
 }
 
 config = {
+    "posting_settings": {
+        "space": SPACE,
+        "merchant_outlet_spaces": MERCHANT_OUTLET_SPACES,
+        "hs_sequence_spaces": HS_SEQUENCE_SPACES,
+        "fields": POSTING_FIELDS,
+    },
     "workflow_name": "etl_OCBC_MTI_RINTIS_ProcessFileRintisQRRecon",
     "owner": "raymundus.liputre",
     "kwargs_db_source": partner_rintis.get("kwargs_db_source"),

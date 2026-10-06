@@ -4,17 +4,13 @@ sys.path.insert(1, '/data/airflow/nfs/dags')
 from airflow.sdk import get_current_context
 from airflow.providers.sftp.hooks.sftp import SFTPHook
 from airflow.providers.ftp.hooks.ftp import FTPHook
-# from airflow import AirflowException
 from pathlib import Path
 from types import SimpleNamespace
 from data_payment.core.model.Models_DisputePWC import DisputeRecord, SEP, DisputeHeader
-# Keterangan: import lama dikomentari karena file dari foto bernama Models_ReconPWC.py.
 from data_payment.core.model.Models_ReconPWC import ReconHeader, ReconRecordData
-from data_payment.core.model.PostingSettings import posting_field, posting_space
+from copy import deepcopy
 import glob, os, logging, zipfile, fnmatch, shutil, datetime, re
 from data_payment.core.connection.Connection4WAY import Way4DB, PwcDB, DBConnection
-# from airflow.providers.microsoft.mssql.hooks.mssql import MsSqlHook
-# from data_payment.core.connection.Connection4WAY import QrisDB
 
 
 def _processing_date(context):
@@ -23,6 +19,40 @@ def _processing_date(context):
     if date is None:
         date = context["dag_run"].run_after
     return date
+
+
+class PostingSettings:
+    def __init__(self, settings=None):
+        self.settings = deepcopy(settings or {})
+
+    def posting_space(self):
+        value = self.settings.get("space", " ")
+        if not isinstance(value, str) or len(value) != 1 or not value.isascii() or not value.isprintable():
+            raise ValueError("posting_settings.space harus satu karakter ASCII yang dapat dicetak")
+        return value
+
+    def posting_field(self, record, name, length):
+        try:
+            value = self.settings["fields"][record][name]
+        except KeyError as exc:
+            raise ValueError(f"Setting {record}.{name} belum diisi pada posting_settings.fields") from exc
+        if not isinstance(value, str) or not value.isascii() or (value and not value.isprintable()):
+            raise ValueError(f"Setting {record}.{name} harus string ASCII satu baris")
+        if len(value) > length:
+            raise ValueError(f"Setting {record}.{name} melebihi panjang field {length}")
+        return value.ljust(length, self.posting_space())
+
+    def _spaces(self, name):
+        count = self.settings.get(name, 0)
+        if type(count) is not int or count < 0:
+            raise ValueError(f"posting_settings.{name} harus integer >= 0")
+        return self.posting_space() * count
+
+    def merchant_outlet_space(self):
+        return self._spaces("merchant_outlet_spaces")
+
+    def hs_sequence_space(self):
+        return self._spaces("hs_sequence_spaces")
 
 
 class Replication(object):
@@ -47,30 +77,25 @@ class Replication(object):
         self.is_split = self.config.get('is_split')
         self.custom_function = self.config.get('custom_function')
 
-        #deny
         self.target_path = self.config.get('target_path')
         self.destination_connection_PWC_POST = self.config.get('destination_connection_PWC_POST')
         self.result_local_way4 = self.config.get('result_local_path_way4')
         self.target_path_onus = self.config.get('target_path_onus')
-        # self.acq_db= self.config.get('acq_db')
 
-        #rama
         self.result_local_path_PWC = self.config.get('result_local_path_PWC')
         self.destination_connection_PWC = self.config.get('destination_connection_PWC')
         self.destination_path_PWC = self.config.get('destination_path_PWC')
         self.destination_connection_type_PWC = self.config.get('destination_connection_type_PWC')
 
-        #roy
         self.destination_schema = self.config.get('destination_schema')
         self.destination_table = self.config.get('destination_table')
         self.destination_table_2 = self.config.get('destination_table_2')
         self.destination_table_dev_test = self.config.get('destination_table_dev_test')
 
-        #query related below
         self.kwargs_db_source = self.config.get('kwargs_db_source')
+        self.posting_settings = self.config.get('posting_settings')
         logging.info(f"config: kwargs_db_source={self.kwargs_db_source}")
 
-    #custom function for to be called by dags function start
     def process_file_mask(self, outgoing_file_name = ""):
         list_file_mask = []
         context = context = get_current_context()
@@ -89,24 +114,13 @@ class Replication(object):
         file_name_mask = str(file_mask.replace('.dsj', date_string))
         list_file_mask = file_name_mask.split("|")
         return list_file_mask
-    #custom function for to be called by dags function end
 
     def check_chk_exists(self):
         try:
-            #init data
             flag = True
-            # context = context = get_current_context()
-            # date = _processing_date(context)
-            # date = date + datetime.timedelta(days=self.fetch_date)
-            # date_string = date.strftime(self.format_date)
 
-            # file_mask = self.file_name_mask.replace('.dsj', date_string)
-            # if len(self.file_name_mask_outgoing) != 0:
-            #     file_mask = self.file_name_mask_outgoing.replace('.dsj', date_string)
-            # file_mask = file_mask + ".chk"
-            # logging.info('File Mask : ' + file_mask)
             list_file_mask = []
-            list_file_mask = self.process_file_mask(self.file_name_mask_outgoing) #kalo masih string kosong otomatis ke self.file_name_mask
+            list_file_mask = self.process_file_mask(self.file_name_mask_outgoing)
 
             if self.destination_connection_type == "FTP":
                 logging.info('Connection Type : ' + self.destination_connection_type)
@@ -157,8 +171,7 @@ class Replication(object):
             date = date + datetime.timedelta(days=self.fetch_date)
             date_string = date.strftime("%y%m%d")
             logging.info('date_string: %s', date_string)
-            #init data
-            if not os.path.exists(self.local_path+date_string[0:2]+'/'+date_string[2:4]+'/'+date_string[4:6]+'/'): #create folder sesuai dengan tanggal file
+            if not os.path.exists(self.local_path+date_string[0:2]+'/'+date_string[2:4]+'/'+date_string[4:6]+'/'):
                 os.makedirs(self.local_path+date_string[0:2]+'/'+date_string[2:4]+'/'+date_string[4:6]+'/')
             logging.info('check path :'+self.local_path+date_string[0:2]+'/'+date_string[2:4]+'/'+date_string[4:6]+'/')
             list_file_mask = []
@@ -169,7 +182,6 @@ class Replication(object):
                 source_hook = FTPHook(ftp_conn_id=self.source_connection)
                 files = sorted(source_hook.list_directory(self.source_path))
                 for file in files:
-                    # if (source_hook.isfile(self.source_path + file)):
                     basename_file = os.path.basename(file)
                     for file_mask in list_file_mask:
                         logging.info('Files: ' + basename_file + ' Mask: ' + file_mask)
@@ -255,7 +267,7 @@ class Replication(object):
         pwc_directory = os.path.join(self.result_local_path_PWC, dateformat)
         os.makedirs(mti_directory, exist_ok=True)
         os.makedirs(pwc_directory, exist_ok=True)
-        splitter = SplitClass(getattr(self, 'kwargs_db_source', None))
+        splitter = SplitClass(getattr(self, 'kwargs_db_source', None), self.posting_settings)
 
         prepared_files = []
         for name in filenames:
@@ -353,7 +365,6 @@ class Replication(object):
                 logging.info('tidak ada file yang cocok: %s', local_files)
                 return
 
-            #conn id MTI & PWC
             destination_hook_mti = FTPHook(ftp_conn_id=self.destination_connection)
             destination_hook_pwc = SFTPHook(ssh_conn_id=self.destination_connection_PWC_POST)
 
@@ -361,11 +372,10 @@ class Replication(object):
                 logging.info('===============SPLIT & SEND FILE START===============')
                 self.kwargs_db_source = getattr(self, 'kwargs_db_source', None)
 
-                split_class = SplitClass(self.kwargs_db_source)
+                split_class = SplitClass(self.kwargs_db_source, self.posting_settings)
 
                 timestamp = split_class.get_timestamp_POST()
 
-                #buat folder sebelum action
                 result_local_path_PWC = os.path.join(self.result_local_path_PWC, dateformat)
                 result_local_path = os.path.join(self.result_local_path, dateformat)
                 os.makedirs(result_local_path, exist_ok=True)
@@ -378,38 +388,31 @@ class Replication(object):
                     logging.info('=============== SENDING FILE START =================')
                     logging.info('processing file: %s', filename)
 
-                    #file hasil extract
                     source_file = os.path.join(local_path, dateformat, filename)
                     logging.info('input_file: %s', source_file)
 
-                    #copy ke folder pwc
                     mti_source_file = os.path.join(result_local_path, filename)
                     pwc_source_file = os.path.join(result_local_path_PWC, filename)
                     logging.info('pwc_source_file: %s', pwc_source_file)
                     logging.info('mti_source_file: %s', mti_source_file)
 
-                    #copy file sebelum di split
                     shutil.copy(source_file, pwc_source_file)
                     logging.info('Copy file pwc success')
                     logging.info('From: %s', source_file)
                     logging.info('To: %s', pwc_source_file)
 
-                    #copy file sebelum di split
                     shutil.copy(source_file, mti_source_file)
                     logging.info('Copy file mti success')
                     logging.info('From: %s', source_file)
                     logging.info('To: %s', mti_source_file)
 
-                    #cek file exist folder
                     logging.info('pwc file exist: %s', os.path.isfile(mti_source_file))
                     logging.info('mti file exist: %s', os.path.isfile(pwc_source_file))
 
-                    #split file pwc
                     logging.info('=============== SPLIT START ==============')
                     logging.info('start split MTI: %s', pwc_source_file)
                     logging.info('start split PWC: %s', mti_source_file)
 
-                    # period = (date + datetime.timedelta(hours=9)).strftime("%Y%m%d")
                     period = date.strftime("%Y%m%d")
                     way4_records = self.get_way4_data_new(
                         period=period,
@@ -436,7 +439,6 @@ class Replication(object):
                     logging.info('PWC file exist: %s', os.path.isfile(pwc_source_file))
 
                     logging.info('============= SPLIT END ==============')
-                    #validasi file split
                     if not os.path.isfile(source_file):
                         raise FileNotFoundError(f'file split not found')
 
@@ -446,7 +448,6 @@ class Replication(object):
                         logging.info('Deleted raw QR_RECON file: %s', qr_file)
                     logging.info('============= SEND START ==============')
 
-                    #create chk file mti
                     logging.info('Creating .chk file mti')
 
                     split_name_mti = f"POSTFLIN_{timestamp}"
@@ -469,13 +470,7 @@ class Replication(object):
                         chk_file_mti,
                         remote_file_mti,
                     )
-                    #COMBINED FILE RINTIS & WAY4
-                    # way4_record = self.get_way4_data()
-                    # mapped_way4 = split_class.map_way4_query_result(way4_record)
-                    # combined_pwc_file = split_class.combine_mapped_posting_result(mapped_rintis=mapped_rintis, mapped_way4=mapped_way4, output_directory
                     print('========= BEFORE PWC STORE =========', flush=True)
-                    # Keterangan: kirim setiap POSTFLIN_*.txt yang benar-benar dibuat
-                    # oleh create_posting_file(), menggunakan nama file hasil generate.
                     for generated_posting_file in generated_posting_files:
                         remote_file_pwc = os.path.join(
                             self.target_path,
@@ -497,10 +492,6 @@ class Replication(object):
                             'tidak ada POSTFLIN hasil generate untuk dikirim ke PWC'
                         )
 
-                    # Kode lama: yang dikirim adalah pwc_source_file berformat
-                    # RH/DH/RT dengan nama remote .chk, bukan hasil generator.
-                    # destination_hook_pwc.store_file(remote_file_pwc, pwc_source_file)
-                    # destination_hook_pwc.store_file(remote_file_pwc, combined_pwc_file)
 
                     destination_hook_pwc.close_conn()
                     print('========= AFTER PWC STORE =========', flush=True)
@@ -508,28 +499,12 @@ class Replication(object):
                     logging.info('============= SEND END ==============')
 
                     logging.info('sukses upload %s -> %s', remote_file_mti+chk_name_mti, remote_file_mti)
-                    # Kode lama: logging.info('sukses upload %s -> %s', pwc_source_file, remote_file_pwc)
 
                     logging.info('============= SEND & SPLIT END ==============')
             else:
                 logging.info('Path MTI', self.result_local_path, 'Not found')
                 logging.info('Path PWC', self.result_local_path_PWC, 'Not found')
                 logging.info('============= END NO SPLIT ==============')
-                # logging.info('============= SENDING UNPROCESSED FILE ==============')
-                # for filename in files_to_send:
-                #     local_file_mti = os.path.join(result_local_path, filename)
-                #     local_file_pwc = os.path.join(result_local_path_PWC, filename)
-                #
-                #     logging.info('local file mti unprocessed:%s', local_file_mti)
-                #     logging.info('local file pwc unprocessed:%s', local_file_mti)
-                #
-                #     #send to mti
-                #     destination_hook_mti.store_file(remote_file_mti, local_file_mti)
-                #     destination_hook_mti.close_conn()
-                #
-                #     #send to pwc
-                #     destination_hook_pwc.store_file(remote_file_pwc, local_file_pwc)
-                #     destination_hook_pwc.close_conn()
         except Exception as e:
             logging.exception(e)
             raise
@@ -537,7 +512,7 @@ class Replication(object):
     def get_way4_data(self, period=None, save_result_file=True):
         con_acq = None
         try:
-            split_class = SplitClass(self.kwargs_db_source)
+            split_class = SplitClass(self.kwargs_db_source, self.posting_settings)
             timestamp = split_class.get_timestamp_POST()
             if period is None:
                 if len(timestamp) < 8 or not timestamp[:8].isdigit():
@@ -654,7 +629,7 @@ class Replication(object):
         con_acq = None
         try:
             self.kwargs_db_source = getattr(self, 'kwargs_db_source', None)
-            split_class = SplitClass(self.kwargs_db_source)
+            split_class = SplitClass(self.kwargs_db_source, self.posting_settings)
             timestamp = split_class.get_timestamp_POST()
 
             if period is None:
@@ -668,9 +643,6 @@ class Replication(object):
             yesterday = datetime.datetime.today() - datetime.timedelta(days=1)
             yesterday = yesterday.strftime("%Y%m%d")
 
-            # SQL lama: and PAN like '936000281%'
-            # SQL lama: and period = %s
-            # Gunakan placeholder bernama karena params berupa dictionary.
             sql = """
                 SELECT
                     merchantid as merchant_id,
@@ -727,7 +699,6 @@ class Replication(object):
 
             records = way4.get_data(
                 sql=sql,
-                # params={"yesterday": yesterday},
                 params={"yesterday": yesterday, "pan_prefix": "936000281%"},
             )
 
@@ -775,8 +746,13 @@ class Replication(object):
             )
             raise
 class SplitClass():
-    def __init__(self, kwargs_db_source):
+    def __init__(self, kwargs_db_source, posting_settings=None):
         self.kwargs_db_source = kwargs_db_source
+        settings = PostingSettings(posting_settings)
+        self.posting_space = settings.posting_space
+        self.posting_field = settings.posting_field
+        self.merchant_outlet_space = settings.merchant_outlet_space
+        self.hs_sequence_space = settings.hs_sequence_space
         logging.info(f"config: kwargs_db_source={self.kwargs_db_source}")
         
 
@@ -790,18 +766,14 @@ class SplitClass():
         try:
             logging.info('========== SPLIT PROCESSED START QR RECON ==========')
 
-            #open file source path
             file_unprocessed = open(str_file_name, 'r')
 
-            #output MTI
             file_processed = open(str_result_name, 'w')
 
-            #output PWC
             file_processed_PWC = open(str_result_pwc, 'w')
 
             merchants = self.get_data_merchant_pwc_qr_acceptor()
             merchants_pwcs = set(str(row[0]).strip() for row in merchants)
-            # merchants_pwcs = {str(row[0]).strip() for row in merchants if row and row[0] is not None}
 
             logging.info('pwc acceptor point: %s', merchants)
             logging.info('merchant_pwcs: %s', merchants_pwcs)
@@ -831,10 +803,6 @@ class SplitClass():
                     rec = ReconRecordData.parse_recon_data_line(line)
                     mpan = str(rec.merchant_pan).strip()
 
-                    # logging.info('REC: %s', rec)
-                    # logging.info('BANK: %s', rec.acquiring_bank_code)
-                    # logging.info('MPAN hasil mapping rintis = [%s]', mpan)
-                    # logging.info('Merchant PWC = %s', merchants_pwcs)
 
                     logging.info('=== END DH RECORD ===')
                     if mpan in merchants_pwcs:
@@ -850,7 +818,6 @@ class SplitClass():
                         logging.info('MID record:%s', mid_records)
                         mid = str(mid).strip()
 
-                        # Kode lama: logging.info('[QR_RECON] MID selected | mpan:%s | type:%s | lenght:%s', mpan,mid,type(mid).__name__,len(str(mid)))
                         logging.info('[QR_RECON][SPLIT] MID dipilih | MPAN=%s | MID=%s | tipe=%s | panjang=%s', mpan, mid, type(mid).__name__, len(mid))
 
                         filename_datetime = self.get_timestamp_POST()
@@ -870,7 +837,6 @@ class SplitClass():
                             **rec.dict(),
                             merchant_number=merchant_number,
                         )
-                        # Kode lama: pwc_posting_records.append((rec, mid))
                         pwc_posting_records.append((posting_rec, mid))
                         logging.info(
                             '[QR_RECON][SPLIT] Merchant siap untuk posting | MPAN=%s | MID(MER_ACCEPTOR_POINT_ID)=%s | MERCHANT_NUMBER=%s | panjang_merchant_number=%s | HS.outlet_number=MID | HS.merchant_number=MERCHANT_NUMBER',
@@ -878,7 +844,6 @@ class SplitClass():
                         )
                         file_processed_PWC.write(rec.to_line() + "\n")
                         row_count_pwc += 1
-                        # record_pwc += int(rec.dispute_amount)
                         logging.info('rec_to_line:%s', rec.to_line())
                         logging.info('filename_split:%s', filename)
                         logging.info('=== END CREATE FILE SPLIT ===')
@@ -887,7 +852,6 @@ class SplitClass():
                         logging.info('merchant MTI')
                         file_processed.write(line)
                         row_count += 1
-                        # record += int(rec.dispute_amount)
 
                 elif line.startswith("RT"):
 
@@ -942,7 +906,6 @@ class SplitClass():
             """
             mpan = str(mpan).strip()
 
-            # Kode lama: logging.info('==== START GET DATA MID FROM MPAN ====')
             logging.info('[QR_RECON][LOOKUP] Mulai lookup MID dan MERCHANT_NUMBER | tabel=MER_ACCEPTOR_POINT | MPAN=%s', mpan)
             logging.info('sql:%s', sql)
             logging.info('mpan acceptor:%s', mpan)
@@ -954,13 +917,11 @@ class SplitClass():
             if records is None:
                 logging.warning('pwc get data return None')
                 records = []
-            # Kode lama: logging.info('records result acceptor point: %s', records)
             logging.info('[QR_RECON][LOOKUP] Selesai | MPAN=%s | jumlah_baris=%s | urutan_kolom=(MER_ACCEPTOR_POINT_ID, MERCHANT_NUMBER) | hasil=%s', mpan, len(records), records)
             if not records:
                 logging.warning('[QR_RECON][LOOKUP] Merchant tidak ditemukan | MPAN=%s', mpan)
             return records
         except Exception as e:
-            # Kode lama: logging.exception('Gagal ambil data MID dari PWC')
             logging.exception('[QR_RECON][LOOKUP] Gagal mengambil MID dan MERCHANT_NUMBER dari PWC | MPAN=%s', mpan)
             raise
 
@@ -992,7 +953,6 @@ class SplitClass():
             transaction_sequence = 0
             sequence_number += 1
             posting_lines.append(
-                # Kode lama: self.generate_hs_record(first_rec, mid, sequence_number).rstrip("\n")
                 self.generate_hs_record(
                     first_rec, mid, sequence_number,
                     merchant_number=self.posting_merchant_number(first_rec),
@@ -1030,7 +990,7 @@ class SplitClass():
         posting_lines.append(self.generate_tr_record(sequence_number, posting_lines))
         full_containt = "\n".join(posting_lines)
 
-        expected_lengths = {"HR": 47, "HS": 89, "DT": 147, "OA": 184, "TS": 133, "TR": 74}
+        expected_lengths = {"HR": 47, "HS": 89 + len(self.merchant_outlet_space()) + len(self.hs_sequence_space()), "DT": 147, "OA": 184, "TS": 133 + len(self.merchant_outlet_space()) + len(self.hs_sequence_space()), "TR": 74}
         for line in posting_lines:
             expected_length = expected_lengths.get(line[:2])
             if expected_length is None or len(line) != expected_length:
@@ -1058,7 +1018,7 @@ class SplitClass():
 
         sequence_name = self.pad_with_spaces(self.to_padded_number(8,this_sequence), 8)
 
-        bank_code_id = posting_field("HR", "institution_ref", 6)
+        bank_code_id = self.posting_field("HR", "institution_ref", 6)
 
         institution_ref = self.pad_with_spaces(bank_code_id, 6)
 
@@ -1073,16 +1033,14 @@ class SplitClass():
             if len(recon_date) == 8
             else self.get_timestamp_POST()
         )
-        tokenization_indicator = posting_field("HR", "tokenization_indicator", 1)
+        tokenization_indicator = self.posting_field("HR", "tokenization_indicator", 1)
 
-        # Merging String
         result = record_type + sequence_name + institution_ref + file_ref + processDate + tokenization_indicator
 
         if len(result) != 47:
             raise ValueError(f"invalid HR RECORD length:{len(result)}, expected 47")
         return result + "\n"
 
-    # Kode lama: def generate_tr_record(self):
     def generate_tr_record(self, sequence_number=1, posting_lines=None):
         record_type = "TR"
 
@@ -1091,8 +1049,8 @@ class SplitClass():
 
         sequence_in_file = self.to_padded_number(8, sequence_number)
 
-        institution_identification = posting_field("TR", "institution_identification", 6)
-        file_sender = posting_field("TR", "file_sender", 6)
+        institution_identification = self.posting_field("TR", "institution_identification", 6)
+        file_sender = self.posting_field("TR", "file_sender", 6)
 
         posting_lines = posting_lines or []
         dt_lines = [line for line in posting_lines if line.startswith("DT")]
@@ -1112,8 +1070,6 @@ class SplitClass():
 
         return result
 
-    # Kode lama: def generate_hs_record(self, rec: ReconRecordData, mid: str):
-    # Kode lama: def generate_hs_record(self, rec: ReconRecordData, mid: str, sequence_number=1):
     def posting_merchant_number(self, rec, merchant_number=None):
         value = merchant_number if merchant_number is not None else getattr(rec, "merchant_number", None)
         if value is None:
@@ -1137,8 +1093,8 @@ class SplitClass():
         last_batch = 0
         new_batch = last_batch + 1
 
-        # Kode lama: record_sequence = self.to_padded_number(8, new_sequence)
         record_sequence = self.to_padded_number(8, sequence_number)
+        record_sequences = self.pad_with_spaces(record_sequence, 8)
         merchant_number_value = self.posting_merchant_number(rec, merchant_number)
         merchant_number = self.pad_with_spaces(merchant_number_value, 15)
         outlet_value = str(getattr(rec, "outlet_number", mid))
@@ -1158,15 +1114,15 @@ class SplitClass():
             getattr(rec, "batch_currency", rec.transaction_amount_currency)
         )
         batch_currency = self.pad_with_spaces(batch_currency_value[:3], 3)
-        batch_type = posting_field("HS", "batch_type", 1)
+        batch_type = self.posting_field("HS", "batch_type", 1)
 
-        # Merging String
-        result = record_type + record_sequence + merchant_number + outlet_number + terminal_id + batch_number + batch_capture_date + batch_datetime + batch_currency + batch_type
+        result = record_type + record_sequence + self.hs_sequence_space() + merchant_number + self.merchant_outlet_space() + outlet_number + terminal_id + batch_number + batch_capture_date + batch_datetime + batch_currency + batch_type
         logging.info('HS final result:[%s]', result)
         logging.info('HS LENGHT = %s', len(result))
 
-        if len(result)!=89:
-            raise ValueError(f"invalid HS RECORD lenght:{len(result)},expected 89")
+        expected_length = 89 + len(self.merchant_outlet_space()) + len(self.hs_sequence_space())
+        if len(result) != expected_length:
+            raise ValueError(f"invalid HS RECORD length:{len(result)}, expected {expected_length}")
 
         return result + "\n"
 
@@ -1192,29 +1148,27 @@ class SplitClass():
 
         record_sequence_in_file = self.to_padded_number(8, sequence_number)
         transaction_sequence_in_batch = self.to_padded_number(7, transaction_sequence)
-        service_type = posting_field("DT", "service_type", 1)
+        service_type = self.posting_field("DT", "service_type", 1)
         voucher_number = self.pad_with_spaces(voucher_generated[:8], 8)
         card_number = self.pad_with_spaces(rec.customer_pan[:22], 22)
-        expiry_date = posting_field("DT", "expiry_date", 6)
+        expiry_date = self.posting_field("DT", "expiry_date", 6)
         processing_date = self.pad_with_spaces(rec.processing_code[:6], 6)
         reversal_flag = str(getattr(rec, "reversal_flag", "N"))[:1]
-        authorization_flag = posting_field("DT", "authorization_flag", 1)
-        post_date = posting_field("DT", "pos_data", 12)
-        # Kode lama: post_entry_mode = self.pad_with_spaces("A2", 4)
-        post_entry_mode = posting_field("DT", "pos_entry_mode", 4)
-        post_condition_code = posting_field("DT", "pos_condition_code", 2)
+        authorization_flag = self.posting_field("DT", "authorization_flag", 1)
+        post_date = self.posting_field("DT", "pos_data", 12)
+        post_entry_mode = self.posting_field("DT", "pos_entry_mode", 4)
+        post_condition_code = self.posting_field("DT", "pos_condition_code", 2)
         transaction_datetime = self.pad_with_spaces(f"{rec.transaction_date}{rec.transaction_time}", 14)
         transaction_amount = self.to_fixed_numeric(rec.transaction_amount[:18], 18)
         transaction_sign = "D" if rec.processing_code[:2] in {"20", "29"} else "C"
         transaction_currency = self.pad_with_spaces(rec.transaction_amount_currency[:3], 3)
-        currency_exponent = posting_field("DT", "currency_exponent", 1)
-        reversal_reason_code = posting_field("DT", "reversal_reason_code", 2)
-        replacement_amounts = posting_field("DT", "replacement_amounts", 18)
+        currency_exponent = self.posting_field("DT", "currency_exponent", 1)
+        reversal_reason_code = self.posting_field("DT", "reversal_reason_code", 2)
+        replacement_amounts = self.posting_field("DT", "replacement_amounts", 18)
         authorization_code = self.pad_with_spaces(rec.approval_code[:6], 6)
-        service_code = posting_field("DT", "service_code", 3)
-        single_message_indicator = posting_field("DT", "single_message_indicator", 1)
+        service_code = self.posting_field("DT", "service_code", 3)
+        single_message_indicator = self.posting_field("DT", "single_message_indicator", 1)
 
-        # Merging String
         result = record_type + record_sequence_in_file + transaction_sequence_in_batch + service_type + voucher_number + card_number + expiry_date + processing_date + reversal_flag + authorization_flag + post_date + post_entry_mode + post_condition_code + transaction_datetime + transaction_amount + transaction_sign + transaction_currency + currency_exponent + reversal_reason_code + replacement_amounts + authorization_code + service_code + single_message_indicator
         if len(result) != 147:
             raise ValueError(f"invalid DT RECORD length:{len(result)}, expected 147")
@@ -1226,23 +1180,22 @@ class SplitClass():
         last_sequence = 0
         new_sequence = last_sequence + 1
 
-        # Kode lama: sequence = self.to_padded_number(8, new_sequence)
         sequence = self.to_padded_number(8, sequence_number)
 
         record_sequence = sequence
         voucher_number = self.to_padded_number(8, voucher_sequence)
-        tip_amount = posting_field("OA", "tip_amount", 18)
-        cashback_amount = posting_field("OA", "cashback_amount", 18)
+        tip_amount = self.posting_field("OA", "tip_amount", 18)
+        cashback_amount = self.posting_field("OA", "cashback_amount", 18)
         fee = self.to_fixed_numeric(rec.convenience_fee[:18], 18)
-        surcharge_fee = posting_field("OA", "surcharge_fee", 18)
+        surcharge_fee = self.posting_field("OA", "surcharge_fee", 18)
         billing_amount = self.to_fixed_numeric(rec.transaction_amount[:18], 18)
         billing_currency = self.pad_with_spaces(rec.transaction_amount_currency[:3], 3)
-        conversion_rate = posting_field("OA", "conversion_rate", 12)
-        rate_exponent = posting_field("OA", "rate_exponent", 2)
-        rate_date = posting_field("OA", "rate_date", 14)
-        reversed_for_future_use = posting_field("OA", "reserved_for_future_use", 9)
+        conversion_rate = self.posting_field("OA", "conversion_rate", 12)
+        rate_exponent = self.posting_field("OA", "rate_exponent", 2)
+        rate_date = self.posting_field("OA", "rate_date", 14)
+        reversed_for_future_use = self.posting_field("OA", "reserved_for_future_use", 9)
         external_ref_id = self.pad_with_spaces(rec.invoice_data[:23], 23)
-        dcc_indicator = posting_field("OA", "dcc_indicator", 1)
+        dcc_indicator = self.posting_field("OA", "dcc_indicator", 1)
         reversed_for_future_use2 = self.pad_with_spaces(rec.retrieval_reference_number[:12], 12)
         result = record_type + record_sequence + voucher_number + tip_amount + cashback_amount + fee + surcharge_fee + billing_amount + billing_currency + conversion_rate + rate_exponent + rate_date + reversed_for_future_use + external_ref_id + dcc_indicator + reversed_for_future_use2
 
@@ -1286,25 +1239,23 @@ class SplitClass():
             sum(int(r.transaction_amount) for r in credit_records), 18
         )
 
-        result = record_type + sequence_in_file + merchant_number + outlet_number + terminal_id + batch_number + batch_capture_date + batch_datetime + record_count_debit + net_amount_debit + record_count_credit + net_amount_credit
-        if len(result) != 133:
-            raise ValueError(f"invalid TS RECORD length:{len(result)}, expected 133")
+        result = record_type + sequence_in_file + self.hs_sequence_space() + merchant_number + self.merchant_outlet_space() + outlet_number + terminal_id + batch_number + batch_capture_date + batch_datetime + record_count_debit + net_amount_debit + record_count_credit + net_amount_credit
+        expected_length = 133 + len(self.merchant_outlet_space()) + len(self.hs_sequence_space())
+        if len(result) != expected_length:
+            raise ValueError(f"invalid TS RECORD length:{len(result)}, expected {expected_length}")
         return result + "\n"
 
     def get_timestamp_POST(self):
         try:
-            # Generate current datetime and format it
             return datetime.datetime.now().strftime("%Y%m%d%H%M%S")
         except Exception as e:
-            # Fallback handling (very rare for datetime operations)
             raise RuntimeError(f"Failed to generate timestamp: {e}")
 
     def get_today_yymmdd(self):
         try:
-            today = datetime.datetime.today()  # Get current local date and time
-            return today.strftime("%y%m%d")  # Format as YYMMDD
+            today = datetime.datetime.today()
+            return today.strftime("%y%m%d")
         except Exception as e:
-            # Fallback to a safe default string in case of failure
             return f"Error: {str(e)}"
 
     def get_today_yyyymmdd(self):
@@ -1312,7 +1263,6 @@ class SplitClass():
             today = datetime.datetime.today()
             return today.strftime("%Y%m%d")
         except Exception as e:
-            # Fallback in case of unexpected datetime issues
             raise RuntimeError(f"Failed to get today's date: {e}")
 
     def get_today_yyyymm(self):
@@ -1320,34 +1270,26 @@ class SplitClass():
             today = datetime.datetime.today()
             return today.strftime("%Y%m")
         except Exception as e:
-            # Fallback in case of unexpected datetime issues
             raise RuntimeError(f"Failed to get today's date: {e}")
 
-    # Function to generate a string of spaces with validation
     def generate_spaces(self, length: str):
-        # Validate input type
         if not isinstance(length, str):
             raise TypeError("Length must be an str.")
 
         spaces_count = int(length) if length.isdigit() else len(length)
 
-        # Kode lama: return " " * int(length)
-        return posting_space() * spaces_count
+        return self.posting_space() * spaces_count
 
     def generate_spaces_int(self, length: int):
-        # Validate input type
         if not isinstance(length, int):
             raise TypeError("Length must be an int.")
 
-        # Validate boundary
         if length < 0:
             raise ValueError("Length cannot be negative.")
 
-        # Generate spaces
-        return posting_space() * length
+        return self.posting_space() * length
 
     def pad_with_spaces(self, text: str, length: int):
-        # type data validation
         if not isinstance(text, str):
             raise TypeError("text parameter must be string.")
         if not isinstance(length, int):
@@ -1355,26 +1297,21 @@ class SplitClass():
         if length < 0:
             raise ValueError("length parameter cannot negatif.")
 
-        # check length
         if len(text) >= length:
             return text
 
-        # count total space needed
         spaces_needed = length - len(text)
-        return text + (posting_space() * spaces_needed)
+        return text + (self.posting_space() * spaces_needed)
 
     def to_padded_number(self, length: int, number: int):
         try:
-            # Validasi tipe
             if not isinstance(length, int) or not isinstance(number, int):
                 raise TypeError("length and number must be integer type.")
 
-            # Validasi nilai length
             if length <= 0:
                 raise ValueError("length must be positive number.")
 
-            # Ubah ke string dan lakukan padding
-            num_str = str(abs(number))  # abs untuk aman jika number negatif
+            num_str = str(abs(number))
             if len(num_str) > length:
                 raise ValueError("length number greater than length requested")
 
@@ -1477,7 +1414,6 @@ class SplitClass():
         if not mid:
             raise ValueError("Mid result mapping is not null")
         return (
-            # Kode lama: self.generate_hs_record(rec, str(mid).strip())
             self.generate_hs_record(
                 rec, mid,
                 merchant_number=self.posting_merchant_number(rec),
@@ -1867,7 +1803,6 @@ class SplitClass():
                             **rec.dict(),
                             merchant_number=merchant_number,
                         )
-                        # Kode lama: posting_records.append((rec, str(mids[0][0]).strip()))
                         posting_records.append((posting_rec, str(mids[0][0]).strip()))
                         logging.info(
                             '[QR_RECON][SPLIT_OFF_US] Merchant siap untuk posting | MPAN=%s | MID(MER_ACCEPTOR_POINT_ID)=%s | MERCHANT_NUMBER=%s | panjang_merchant_number=%s | HS.outlet_number=MID | HS.merchant_number=MERCHANT_NUMBER',
@@ -1929,7 +1864,6 @@ class SplitClass():
         ]
         rrns = [r["retrieval_reference_number"] for r in records]
 
-        # get data qris transaction enrichment in chunks
         qris_data = {}
         chunk_size = 5000
         for i in range(0, len(rrns), chunk_size):

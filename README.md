@@ -5,6 +5,23 @@ PostgreSQL, Oracle, FTP, dan SFTP lokal. Adapter kompatibilitas sudah digabung
 ke Compose utama; tidak perlu `compose.compat.yaml`.
 Server SSH PWC dummy menggunakan Compose terpisah di `scripts/pwc-ssh-demo/`.
 
+## Versi runtime
+
+Runtime container diverifikasi pada 6 Oktober 2026:
+
+| Komponen | Versi |
+|---|---|
+| Apache Airflow | **3.1.7** |
+| Python | **3.12.12** |
+| Base image Docker | `apache/airflow:3.1.7-python3.12` |
+
+Untuk mengecek versi runtime yang sedang berjalan:
+
+```bash
+docker compose exec -T airflow airflow version
+docker compose exec -T airflow python --version
+```
+
 ## Upgrade dari Airflow 2
 
 Referensi: [panduan upgrade resmi Airflow 3.1.7](https://airflow.apache.org/docs/apache-airflow/3.1.7/installation/upgrading_to_airflow3.html).
@@ -197,7 +214,7 @@ otomatis dirangkai sebagai task pada DAG utama.
 
 ## Setting global generator POSTFLIN
 
-Edit [`PostingSettings.py`](dags/data_payment/core/model/PostingSettings.py),
+Edit setting di [`PostFile_QRRecon.py`](dags/data_payment/workflow/PostFile_QRRecon.py),
 lalu trigger run baru. File hasil sebelumnya tidak berubah.
 
 - `SPACE`: satu karakter padding untuk field teks dan field kosong (default spasi).
