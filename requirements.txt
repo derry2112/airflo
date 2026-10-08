@@ -5,3 +5,4 @@ apache-airflow-providers-oracle
 apache-airflow-providers-microsoft-mssql
 apache-airflow-providers-ftp
 apache-airflow-providers-sftp
+opentelemetry-api
