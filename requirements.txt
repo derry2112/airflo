@@ -6,3 +6,9 @@ apache-airflow-providers-microsoft-mssql
 apache-airflow-providers-ftp
 apache-airflow-providers-sftp
 opentelemetry-api
+polars
+openpyxl
+requests
+apache-airflow-providers-ssh
+pandas
+xlsxwriter
