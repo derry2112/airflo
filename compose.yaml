@@ -17,6 +17,9 @@ services:
       AIRFLOW_CONN_SFTP_PWC_POST: "sftp://airflow:airflow@sftp-pwc:22"
       # Database transaksi Way4 yang diakses oleh Connection4WAY.py.
       AIRFLOW_CONN_DB_REKON_UAT: "postgresql://airflow:airflow@postgres:5432/db_rekon_uat"
+      POSTINGFILE_S3_BUCKET: postingfile
+      POSTINGFILE_S3_CONNECTION: local_s3
+      AIRFLOW_CONN_LOCAL_S3: '{"conn_type":"aws","login":"localposting","password":"localposting-dev-secret","extra":{"endpoint_url":"http://s3-local:9000","region_name":"us-east-1","config_kwargs":{"s3":{"addressing_style":"path"}}}}'
       PYTHONPATH: "/opt/airflow/runtime-compat:/opt/airflow/runtime"
     ports:
       - "8080:8080"
@@ -39,6 +42,32 @@ services:
       timeout: 5s
       retries: 30
       start_period: 60s
+
+  s3-local:
+    image: rustfs/rustfs@sha256:1803faef57627e2d9c2e7d89d655d712ddded5389040054987163043fecb6a3c
+    container_name: airflow-s3-local
+    command: ["/data"]
+    environment:
+      RUSTFS_ACCESS_KEY: localposting
+      RUSTFS_SECRET_KEY: localposting-dev-secret
+      RUSTFS_CONSOLE_ENABLE: "true"
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+    volumes:
+      - s3-local-data:/data
+
+  s3-init:
+    image: airflow-project:3.1.7
+    depends_on:
+      - s3-local
+    entrypoint: ["python", "/scripts/init.py"]
+    environment:
+      S3_ENDPOINT_URL: http://s3-local:9000
+      AWS_ACCESS_KEY_ID: localposting
+      AWS_SECRET_ACCESS_KEY: localposting-dev-secret
+    volumes:
+      - ./scripts/local-s3:/scripts:ro
 
   ftp:
     image: fauria/vsftpd
@@ -114,6 +143,7 @@ services:
       start_period: 10s
 
 volumes:
+  s3-local-data:
   airflow-data:
   airflow2-data:
   oracle-data:

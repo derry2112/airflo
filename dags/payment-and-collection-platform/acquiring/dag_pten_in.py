@@ -2,13 +2,12 @@ from datetime import datetime, timezone, timedelta
 import logging
 import os
 from dags.utils.situtils.BaseDagsClient import ConfigClient
-from airflow.sdk import dag, task, chain, Asset, Metadata
+from airflow.sdk import dag, task, Asset, Metadata
 import time
 
 from dags.utils.callback import Callback
 from dags.utils.models.airflow_constant import RecordEstimate, StorageEstimate, TimeEstimate
 from utils.telemetry.tracing import tracer
-from dags.utils.sftp import SftpHook, SFTPHookOcbc
 from typing import List, Set, NamedTuple
 import polars as ps
 from dags.utils.postgres import PostgresEtlHook
@@ -33,7 +32,6 @@ if _project_root not in sys.path:
 
 
 logger = logging.getLogger(__name__)
-sftp = SftpHook()
 db_control = PostgresEtlHook()
 db_source = OracleEtlHook()
 config = {
@@ -42,8 +40,6 @@ config = {
     "db_source": "oracle-db-sit-pwc",
     "db_control": "postgres-db-acquiring",
     "pten_in_file_path": "/data/airflow/nfs/artifacts/data_payment/acquiring/pten/in",
-    "pten_in_remote_file_path": "/mtiuat/toocbc/PTEN/in",
-    "sftp_pten": "sftp-pten",
     "email_list": [],
 }
 FILE_PATH = os.path.dirname(os.path.realpath(__file__))
@@ -69,7 +65,7 @@ dynamic_tags = [
 @dag(
     dag_id=workflow_name,
     schedule=user_cron,
-    description="PTEN IN merchant processing and Excel upload",
+    description="PTEN IN merchant processing and Excel generation",
     default_args=default_args,
     start_date=datetime.strptime(start_date, "%Y-%m-%d").replace(tzinfo=tz),
     catchup=False,
@@ -80,8 +76,6 @@ dynamic_tags = [
 )
 def dag_pten_in():
     local_file_path = config.get('pten_in_file_path')
-    remote_file_path = config.get('pten_in_remote_file_path')
-    connectionftp = config.get('sftp_pten')
 
     @task
     @tracer.start_as_current_span(f"{dag_name}_task_main_process")
@@ -498,26 +492,6 @@ def dag_pten_in():
         return full_path, df
 
     @task
-    @tracer.start_as_current_span(f"{dag_name}_task_upload_to_sftp")
-    def upload_to_sftp():
-        folder_path = local_file_path
-        files = [f for f in os.listdir(folder_path) if f.endswith('.xlsx')]
-        if not files:
-            logging.info('No files to upload in %s', folder_path)
-            return
-        hook = SFTPHookOcbc(ssh_conn_id=connectionftp)
-        remote_dir = remote_file_path
-        with hook.get_conn() as sftp_client:
-            try:
-                sftp_client.mkdir(remote_dir)
-            except IOError:
-                pass
-            for f in files:
-                local = os.path.join(folder_path, f)
-                sftp_client.put(local, f'{remote_dir}/{f}')
-                logging.info('Uploaded %s to %s/', f, remote_dir)
-
-    @task
     @tracer.start_as_current_span(f"{dag_name}_task_update_status_log")
     def update_status_log():
         db_source.exec_cursor(
@@ -532,24 +506,9 @@ def dag_pten_in():
         )
         logging.info('Successfully update status onboarding to SENT')
 
-    @task
-    @tracer.start_as_current_span(f"{dag_name}_task_delete_local_file")
-    def delete_local_file():
-        folder_path = local_file_path
-        for filename in os.listdir(folder_path):
-            file_path = os.path.join(folder_path, filename)
-            os.remove(file_path)
-
     process = main_process()
-    upload = upload_to_sftp()
     status = update_status_log()
-    cleanup = delete_local_file()
-    chain(
-        process,
-        upload,
-        status,
-        cleanup,
-    )
+    process >> status
 
 
 dag_pten_in()

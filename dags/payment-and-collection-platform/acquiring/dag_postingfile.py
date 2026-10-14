@@ -7,14 +7,15 @@ import sys
 from pathlib import Path
 import fnmatch
 import glob
-import shutil
 import zipfile
+from contextlib import contextmanager
+from io import BytesIO
+from urllib.parse import urlsplit
 from copy import deepcopy
 from types import SimpleNamespace
 from typing import List, NamedTuple
-
+from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 from airflow.sdk import dag, task, get_current_context
-# Airflow adds the dags directory to sys.path; dags.utils needs its parent.
 _project_root = str(Path(__file__).resolve().parents[3])
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
@@ -69,12 +70,9 @@ config = {'posting_settings': {'space': ' ',
  'workflow_name': 'dag_postingfile',
  'owner': 'raymundus.liputre',
  'email_list': [],
- 'kwargs_db_source': {'type': 'postgres',
-                      'workflow_name': 'workflow',
-                      'connection_id': 'db_acq_psql',
-                      'chunksize': 10000},
  'db_way4': 'db_rekon_uat',
  'db_source': 'pwcDB',
+ 'db_acq': 'db_acq_psql',
  'schedule_interval': '0 5-23/2 * * *',
  'start_date': '2023-01-01',
  'tags': ['data_payment', 'acquiring', 'splitfile', 'data_payment', 'core'],
@@ -87,6 +85,9 @@ config = {'posting_settings': {'space': ' ',
  'format_date': '%Y%m%d',
  'result_local_path': '/data/airflow/nfs/artifacts/data_payment/acquiring/result/rintis/',
  'result_local_path_PWC': '/data/airflow/nfs/artifacts/data_payment/acquiring/result/rintisPWC',
+ 's3_bucket': os.getenv('POSTINGFILE_S3_BUCKET'),
+ 's3_connection': os.getenv('POSTINGFILE_S3_CONNECTION', 'aws_default'),
+ 's3_prefix': os.getenv('POSTINGFILE_S3_PREFIX', 'postingfile'),
  'fetch_date': 0,
  'local_path': '/data/airflow/nfs/artifacts/data_payment/acquiring/file/',
  'file_name_mask': 'QR_RECON_*.dsj_ISS',
@@ -142,7 +143,6 @@ default_args = {
 )
 def dag_postingfile():
     posting_settings = deepcopy(config['posting_settings'])
-    kwargs_db_source = config['kwargs_db_source']
 
     @task
     @tracer.start_as_current_span(f"{dag_name}_task_get_unprocessed_file")
@@ -153,7 +153,7 @@ def dag_postingfile():
             masks = _process_file_mask(config['file_name_mask_outgoing'])
             if any((fnmatch.fnmatch(os.path.basename(name), mask + '.chk') for name in remote_files for mask in masks)):
                 logger.info('Marker .chk sudah ada; posting dilewati')
-                return []
+                # return []
         finally:
             destination.close_conn()
         source = _hook(config['source_connection_type'], config['source_connection'])
@@ -198,12 +198,13 @@ def dag_postingfile():
             source_file = os.path.join(local_path, filename)
             mti_file = os.path.join(mti_path, filename)
             pwc_file = os.path.join(pwc_path, filename)
-            shutil.copy(source_file, mti_file)
-            shutil.copy(source_file, pwc_file)
             way4_records = _get_way4_data_new(period=date.strftime('%Y%m%d'), save_result_file=False)
             posting_records = _map_way4_to_posting_records_new(way4_records)
             posting_files = _split_rintis_qr_recon(str_file_name=source_file, str_result_name=mti_file, str_result_pwc=pwc_file, way4_posting_records=posting_records)
-            out_process_datamap.append(ProcessDataMap(filename, mti_file, pwc_file, posting_files)._asdict())
+            mti_transfer = _stage_result(mti_file, date_folder, 'mti')
+            pwc_transfer = _stage_result(pwc_file, date_folder, 'pwc')
+            posting_transfers = [_stage_result(path, date_folder, 'posting') for path in posting_files]
+            out_process_datamap.append(ProcessDataMap(filename, mti_transfer, pwc_transfer, posting_transfers)._asdict())
         for raw_file in glob.glob(os.path.join(config['result_local_path_PWC'], 'QR_RECON*')):
             os.remove(raw_file)
         return out_process_datamap
@@ -219,19 +220,57 @@ def dag_postingfile():
             try:
                 for result in processed_files:
                     remote_mti = os.path.join(config['destination_path'], result['filename']).replace('\\', '/')
-                    mti.store_file(remote_mti, result['mti_local_filepath'])
+                    _send_stream(mti, config['destination_connection_type'], remote_mti, result['mti_local_filepath'])
                     for filepath in result['posting_local_filepaths']:
                         remote_pwc = os.path.join(config['target_path'], os.path.basename(filepath)).replace('\\', '/')
-                        pwc.store_file(remote_pwc, filepath)
-                    marker = result['mti_local_filepath'] + '.chk'
-                    with open(marker, 'w', encoding='utf-8'):
-                        pass
-                    mti.store_file(remote_mti + '.chk', marker)
+                        _send_stream(pwc, 'SFTP', remote_pwc, filepath)
+                    with BytesIO() as marker:
+                        _write_remote_stream(mti, config['destination_connection_type'], remote_mti + '.chk', marker)
                     logger.info('Posting terkirim: %s', result['filename'])
             finally:
                 pwc.close_conn()
         finally:
             mti.close_conn()
+
+    def _stage_result(local_file, date_folder, destination):
+        bucket = config.get('s3_bucket')
+        if not bucket:
+            return local_file
+        key = '/'.join(part.strip('/') for part in (
+            config.get('s3_prefix', 'postingfile'), destination,
+            date_folder, os.path.basename(local_file),
+        ) if part)
+        client = S3Hook(aws_conn_id=config['s3_connection']).get_conn()
+        with open(local_file, 'rb') as stream:
+            client.upload_fileobj(stream, bucket, key)
+        logger.info('Result staged at s3://%s/%s', bucket, key)
+        return f's3://{bucket}/{key}'
+
+    @contextmanager
+    def _open_transfer_source(filepath):
+        if filepath.startswith('s3://'):
+            location = urlsplit(filepath)
+            client = S3Hook(aws_conn_id=config['s3_connection']).get_conn()
+            stream = client.get_object(Bucket=location.netloc, Key=location.path.lstrip('/'))['Body']
+        else:
+            stream = open(filepath, 'rb')
+        try:
+            yield stream
+        finally:
+            stream.close()
+
+    def _write_remote_stream(hook, connection_type, remote_path, stream):
+        connection = hook.get_conn()
+        if connection_type == 'FTP':
+            connection.storbinary(f'STOR {remote_path}', stream)
+        elif connection_type == 'SFTP':
+            connection.putfo(stream, remote_path)
+        else:
+            raise ValueError(f'Connection type tidak didukung: {connection_type}')
+
+    def _send_stream(hook, connection_type, remote_path, filepath):
+        with _open_transfer_source(filepath) as stream:
+            _write_remote_stream(hook, connection_type, remote_path, stream)
 
     def _processing_date(context):
         date = context.get('logical_date')
@@ -240,10 +279,10 @@ def dag_postingfile():
         return date
 
     def _file_date():
-        return _processing_date(get_current_context()) + timedelta(days=config['fetch_date'])
+        return _processing_date(get_current_context()).astimezone(tz) + timedelta(days=config['fetch_date'])
 
     def _process_file_mask(outgoing_file_name=''):
-        date = _file_date() + timedelta(hours=9)
+        date = _file_date()
         mask = outgoing_file_name or config['file_name_mask']
         return mask.replace('.dsj', date.strftime(config['format_date'])).split('|')
 
@@ -253,7 +292,6 @@ def dag_postingfile():
     def _get_way4_data_new(period=None, save_result_file=True):
         con_acq = None
         try:
-            kwargs_db_source = config.get('kwargs_db_source')
             timestamp = _get_timestamp_POST()
             if period is None:
                 if len(timestamp) < 8 or not timestamp[:8].isdigit():
@@ -311,7 +349,7 @@ def dag_postingfile():
             logging.info('period: %s', period)
             logging.info('sql: %s', sql)
             logging.info('connection db way4')
-            records = db_way4.get_records(sql=sql, connection_id=config.get('db_way4'), params={'yesterday': yesterday, 'pan_prefix': '936000281%'})
+            records = db_way4.read_polar_with_exec(sql=sql, connection_id=config.get('db_way4'), params={'yesterday': yesterday, 'pan_prefix': '936000281%'})
             if records is None:
                 logging.warning('way4 get data return None | period=%s | con_acq=%s', period, con_acq)
                 records = []
@@ -360,6 +398,7 @@ def dag_postingfile():
         return _posting_spaces('hs_sequence_spaces')
 
     def _split_rintis_qr_recon(str_file_name, str_result_name, str_result_pwc, way4_posting_records=None):
+        file_unprocessed = file_processed = file_processed_PWC = None
         try:
             logging.info('========== SPLIT PROCESSED START QR RECON ==========')
             file_unprocessed = open(str_file_name, 'r')
@@ -438,16 +477,19 @@ def dag_postingfile():
         except Exception:
             logging.info('Error split rintis RAW')
             raise
+        finally:
+            for stream in (file_unprocessed, file_processed, file_processed_PWC):
+                if stream is not None:
+                    stream.close()
 
     def _get_data_merchant_pwc_qr_acceptor():
         logging.info('START Get Data merchant PWC')
-        logging.info(f'get_data: kwargs_db_source={kwargs_db_source}')
         try:
             merchant_query = 'SELECT AP_ON_ID_10 FROM MER_ACCEPTOR_POINT'
             logging.info('get data merchant pwc')
             logging.info('executing query: %s', merchant_query)
             logging.info('connection db PWC')
-            records = db_source.get_records(sql=merchant_query, connection_id=config.get('db_source'))
+            records = db_source.read_polar_with_exec(sql=merchant_query, connection_id=config.get('db_source'))
             if records is None:
                 logging.warning('pwc get data return None')
                 records = []
@@ -466,7 +508,7 @@ def dag_postingfile():
             logging.info('[QR_RECON][LOOKUP] Mulai lookup MID dan MERCHANT_NUMBER | tabel=MER_ACCEPTOR_POINT | MPAN=%s', mpan)
             logging.info('sql:%s', sql)
             logging.info('mpan acceptor:%s', mpan)
-            records = db_source.get_records(sql=sql, connection_id=config.get('db_source'), params={'mpan': mpan})
+            records = db_source.read_polar_with_exec(sql=sql, connection_id=config.get('db_source'), params={'mpan': mpan})
             if records is None:
                 logging.warning('pwc get data return None')
                 records = []
@@ -826,11 +868,6 @@ def dag_postingfile():
 
     def _get_data_qris_enrichment(records, columns):
         logging.info('START Get Data QRIS Enrichment')
-        if not kwargs_db_source:
-            logging.info('kwargs_db_source is None or empty. Check Operator initialization in DAG.')
-        if not isinstance(kwargs_db_source, dict):
-            logging.error(f'kwargs_db_source must be a dict, got {type(kwargs_db_source)}')
-            raise ValueError('kwargs_db_source must be a dictionary.')
         records = [dict(zip(columns, r)) if not isinstance(r, dict) else r for r in records]
         rrns = [r['retrieval_reference_number'] for r in records]
         qris_data = {}
@@ -852,7 +889,7 @@ def dag_postingfile():
                 where qtlt.rrn = any(%(rrns)s)
             """
             logging.info(f'Executing query batch {i // chunk_size + 1}, size: {len(batch)}')
-            rows = db_enrichment.get_records(sql=get_qris_query, connection_id=kwargs_db_source['connection_id'], params={'rrns': batch})
+            rows = db_enrichment.read_polar_with_exec(sql=get_qris_query, connection_id=config['db_acq'], params={'rrns': batch})
             for row in rows:
                 rrn = row[0]
                 if rrn not in qris_data:
