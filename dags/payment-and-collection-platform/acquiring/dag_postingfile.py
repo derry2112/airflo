@@ -1,33 +1,49 @@
-"""Posting QR Recon dengan flow TaskFlow dan helper lokal."""
-
+from airflow.sdk import dag, task, get_current_context
 from datetime import datetime, timezone, timedelta
-import logging
-import os
-import sys
 from pathlib import Path
-import fnmatch
-import glob
-import zipfile
-from contextlib import contextmanager
-from io import BytesIO
-from urllib.parse import urlsplit
 from copy import deepcopy
 from types import SimpleNamespace
 from typing import List, NamedTuple
-from airflow.providers.amazon.aws.hooks.s3 import S3Hook
-from airflow.sdk import dag, task, get_current_context
-_project_root = str(Path(__file__).resolve().parents[3])
-if _project_root not in sys.path:
-    sys.path.insert(0, _project_root)
-
+from dags.utils.telemetry.tracing import tracer
+from dags.utils.ftp import FTPHookOcbc
 from dags.utils.sftp import SftpHook, SFTPHookOcbc
 from dags.utils.postgres import PostgresEtlHook
 from dags.utils.oracle import OracleEtlHook
 from dags.utils.callback import Callback
-from dags.utils.telemetry.tracing import tracer
-from dags.data_payment.core.model.Models_ReconPWC import ReconHeader, ReconRecordData
+from dags.utils.models.model_postingfile import ReconHeader, ReconRecordData
+from dags.utils.models.airflow_constant import RecordEstimate, StorageEstimate, TimeEstimate
+import logging
+import os, fnmatch, glob, shutil, zipfile, sys
 
+_project_root = str(Path(__file__).resolve().parents[3])
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
 
+class GenericSFTPHook:
+    def __init__(self, ssh_conn_id):
+        self.hook = SFTPHookOcbc(ssh_conn_id=ssh_conn_id)
+        self.conn = None
+
+    def listdir(self, path):
+        if self.conn is None:
+            self.conn = self.hook.get_conn()
+
+        return self.conn.listdir(path)
+
+    def retrieve_file(self, remote_path, local_path):
+        if self.conn is None:
+            self.conn = self.hook.get_conn()
+        return self.conn.get(remote_path, local_path)
+
+    def store_file(self, remote_path, local_path):
+        if self.conn is None:
+            self.conn = self.hook.get_conn()
+        return self.conn.put(local_path, remote_path)
+
+    def close_conn(self):
+        if self.conn:
+            self.conn.close()
+            self.conn = None
 class ProcessDataMap(NamedTuple):
     filename: str
     mti_local_filepath: str
@@ -68,26 +84,32 @@ config = {'posting_settings': {'space': ' ',
                                  'TR': {'institution_identification': 'ID7339',
                                         'file_sender': 'ID7339'}}},
  'workflow_name': 'dag_postingfile',
- 'owner': 'raymundus.liputre',
+ 'owner': 'acquiring',
  'email_list': [],
  'db_way4': 'db_rekon_uat',
- 'db_source': 'pwcDB',
+ 'db_source': 'db_rekon_pwc',
  'db_acq': 'db_acq_psql',
  'schedule_interval': '0 5-23/2 * * *',
  'start_date': '2023-01-01',
  'tags': ['data_payment', 'acquiring', 'splitfile', 'data_payment', 'core'],
- 'source_connection': 'FTP_EBSP',
- 'source_path': '/ACQ/MTI/ClearingRintisQRIS/',
- 'source_connection_type': 'FTP',
- 'destination_connection': 'FTP_MTI',
- 'destination_path': '/sftpdata/mti/mti/fromocbc/FileClearing/Rintis/',
- 'destination_connection_type': 'FTP',
+ # 'source_connection': 'FTP_EBSP',
+ # 'source_path': '/ACQ/MTI/ClearingRintisQRIS/',
+ # 'source_connection_type': 'FTP',
+
+ 'source_connection': 'SFTP_EBSP',
+ 'source_path': '/pwrcard/home/usr/data/ACQ/MTI/ClearingRintisQRIS/',
+ 'source_connection_type': 'SFTP',
+
+ 'destination_connection': 'SFTP_MTI',
+ #AIRFLOW 3 UAT
+ 'destination_path': '/sftpdata/mtiuat/mtiuat/fromocbc/FileClearing/Rintis',
+ # AIRFLOW 2 SIT
+ # 'destination_path': '/sftpdata/mti/mti/fromocbc/FileClearing/Rintis/',
+ 'destination_connection_type': 'SFTP',
+ 
  'format_date': '%Y%m%d',
  'result_local_path': '/data/airflow/nfs/artifacts/data_payment/acquiring/result/rintis/',
  'result_local_path_PWC': '/data/airflow/nfs/artifacts/data_payment/acquiring/result/rintisPWC',
- 's3_bucket': os.getenv('POSTINGFILE_S3_BUCKET'),
- 's3_connection': os.getenv('POSTINGFILE_S3_CONNECTION', 'aws_default'),
- 's3_prefix': os.getenv('POSTINGFILE_S3_PREFIX', 'postingfile'),
  'fetch_date': 0,
  'local_path': '/data/airflow/nfs/artifacts/data_payment/acquiring/file/',
  'file_name_mask': 'QR_RECON_*.dsj_ISS',
@@ -104,10 +126,11 @@ workflow_name = config["workflow_name"]
 dag_name = workflow_name
 callback = Callback(email_list=config["email_list"])
 
-# Manual agar tidak menggandakan pengiriman otomatis dari DAG lama.
-user_cron = None
 start_date = config["start_date"]
 tz = timezone(timedelta(hours=7))
+user_cron = "15 * * * *"
+timezone_used = "Asia/Jakarta"
+
 app_name = os.path.basename(os.path.dirname(FILE_PATH))
 job_type = "file"
 job_operation = "posting"
@@ -117,6 +140,9 @@ dynamic_tags = list(dict.fromkeys([
     f"job:{job_type}",
     f"job:{job_type}:{job_operation}",
     f"owner:{config['owner']}",
+    f"{TimeEstimate.BETWEEN_2M_5M}",
+    f"{StorageEstimate.BELOW_1GB}",
+    f"{RecordEstimate.BELOW_1K}",
 ]))
 default_args = {
     "owner": config["owner"],
@@ -126,7 +152,6 @@ default_args = {
     "priority_weight": 10,
     "execution_timeout": timedelta(minutes=10),
 }
-
 
 
 @dag(
@@ -147,18 +172,9 @@ def dag_postingfile():
     @task
     @tracer.start_as_current_span(f"{dag_name}_task_get_unprocessed_file")
     def get_unprocessed_files() -> List[str]:
-        destination = _hook(config['destination_connection_type'], config['destination_connection'])
-        try:
-            remote_files = destination.list_directory(config['destination_path'])
-            masks = _process_file_mask(config['file_name_mask_outgoing'])
-            if any((fnmatch.fnmatch(os.path.basename(name), mask + '.chk') for name in remote_files for mask in masks)):
-                logger.info('Marker .chk sudah ada; posting dilewati')
-                # return []
-        finally:
-            destination.close_conn()
         source = _hook(config['source_connection_type'], config['source_connection'])
         try:
-            files = sorted(source.list_directory(config['source_path']))
+            files = sorted(source.listdir(config['source_path']))
             unprocessed = [os.path.basename(name) for name in files if any((fnmatch.fnmatch(os.path.basename(name), mask) for mask in _process_file_mask()))]
         finally:
             source.close_conn()
@@ -198,13 +214,12 @@ def dag_postingfile():
             source_file = os.path.join(local_path, filename)
             mti_file = os.path.join(mti_path, filename)
             pwc_file = os.path.join(pwc_path, filename)
+            shutil.copy(source_file, mti_file)
+            shutil.copy(source_file, pwc_file)
             way4_records = _get_way4_data_new(period=date.strftime('%Y%m%d'), save_result_file=False)
             posting_records = _map_way4_to_posting_records_new(way4_records)
             posting_files = _split_rintis_qr_recon(str_file_name=source_file, str_result_name=mti_file, str_result_pwc=pwc_file, way4_posting_records=posting_records)
-            mti_transfer = _stage_result(mti_file, date_folder, 'mti')
-            pwc_transfer = _stage_result(pwc_file, date_folder, 'pwc')
-            posting_transfers = [_stage_result(path, date_folder, 'posting') for path in posting_files]
-            out_process_datamap.append(ProcessDataMap(filename, mti_transfer, pwc_transfer, posting_transfers)._asdict())
+            out_process_datamap.append(ProcessDataMap(filename, mti_file, pwc_file, posting_files)._asdict())
         for raw_file in glob.glob(os.path.join(config['result_local_path_PWC'], 'QR_RECON*')):
             os.remove(raw_file)
         return out_process_datamap
@@ -220,57 +235,19 @@ def dag_postingfile():
             try:
                 for result in processed_files:
                     remote_mti = os.path.join(config['destination_path'], result['filename']).replace('\\', '/')
-                    _send_stream(mti, config['destination_connection_type'], remote_mti, result['mti_local_filepath'])
+                    mti.store_file(remote_mti, result['mti_local_filepath'])
                     for filepath in result['posting_local_filepaths']:
                         remote_pwc = os.path.join(config['target_path'], os.path.basename(filepath)).replace('\\', '/')
-                        _send_stream(pwc, 'SFTP', remote_pwc, filepath)
-                    with BytesIO() as marker:
-                        _write_remote_stream(mti, config['destination_connection_type'], remote_mti + '.chk', marker)
+                        pwc.store_file(remote_pwc, filepath)
+                    marker = result['mti_local_filepath'] + '.chk'
+                    with open(marker, 'w', encoding='utf-8'):
+                        pass
+                    mti.store_file(remote_mti + '.chk', marker)
                     logger.info('Posting terkirim: %s', result['filename'])
             finally:
                 pwc.close_conn()
         finally:
             mti.close_conn()
-
-    def _stage_result(local_file, date_folder, destination):
-        bucket = config.get('s3_bucket')
-        if not bucket:
-            return local_file
-        key = '/'.join(part.strip('/') for part in (
-            config.get('s3_prefix', 'postingfile'), destination,
-            date_folder, os.path.basename(local_file),
-        ) if part)
-        client = S3Hook(aws_conn_id=config['s3_connection']).get_conn()
-        with open(local_file, 'rb') as stream:
-            client.upload_fileobj(stream, bucket, key)
-        logger.info('Result staged at s3://%s/%s', bucket, key)
-        return f's3://{bucket}/{key}'
-
-    @contextmanager
-    def _open_transfer_source(filepath):
-        if filepath.startswith('s3://'):
-            location = urlsplit(filepath)
-            client = S3Hook(aws_conn_id=config['s3_connection']).get_conn()
-            stream = client.get_object(Bucket=location.netloc, Key=location.path.lstrip('/'))['Body']
-        else:
-            stream = open(filepath, 'rb')
-        try:
-            yield stream
-        finally:
-            stream.close()
-
-    def _write_remote_stream(hook, connection_type, remote_path, stream):
-        connection = hook.get_conn()
-        if connection_type == 'FTP':
-            connection.storbinary(f'STOR {remote_path}', stream)
-        elif connection_type == 'SFTP':
-            connection.putfo(stream, remote_path)
-        else:
-            raise ValueError(f'Connection type tidak didukung: {connection_type}')
-
-    def _send_stream(hook, connection_type, remote_path, filepath):
-        with _open_transfer_source(filepath) as stream:
-            _write_remote_stream(hook, connection_type, remote_path, stream)
 
     def _processing_date(context):
         date = context.get('logical_date')
@@ -279,15 +256,23 @@ def dag_postingfile():
         return date
 
     def _file_date():
-        return _processing_date(get_current_context()).astimezone(tz) + timedelta(days=config['fetch_date'])
+        return _processing_date(get_current_context()) + timedelta(days=config['fetch_date'])
 
     def _process_file_mask(outgoing_file_name=''):
-        date = _file_date()
+        date = _file_date() + timedelta(hours=9)
         mask = outgoing_file_name or config['file_name_mask']
         return mask.replace('.dsj', date.strftime(config['format_date'])).split('|')
 
     def _hook(connection_type, connection_id):
-        return sftp.get_hook(connection_type, connection_id)
+        if connection_type == "FTP":
+            return FTPHookOcbc(ftp_conn_id=connection_id)
+
+        if connection_type == "SFTP":
+            return GenericSFTPHook(ssh_conn_id=connection_id)
+
+        raise ValueError(
+            f"Unsupported connection type: {connection_type}"
+        )
 
     def _get_way4_data_new(period=None, save_result_file=True):
         con_acq = None
@@ -398,7 +383,6 @@ def dag_postingfile():
         return _posting_spaces('hs_sequence_spaces')
 
     def _split_rintis_qr_recon(str_file_name, str_result_name, str_result_pwc, way4_posting_records=None):
-        file_unprocessed = file_processed = file_processed_PWC = None
         try:
             logging.info('========== SPLIT PROCESSED START QR RECON ==========')
             file_unprocessed = open(str_file_name, 'r')
@@ -477,10 +461,6 @@ def dag_postingfile():
         except Exception:
             logging.info('Error split rintis RAW')
             raise
-        finally:
-            for stream in (file_unprocessed, file_processed, file_processed_PWC):
-                if stream is not None:
-                    stream.close()
 
     def _get_data_merchant_pwc_qr_acceptor():
         logging.info('START Get Data merchant PWC')
@@ -778,7 +758,6 @@ def dag_postingfile():
             raise
 
     def _to_fixed_numeric(value, length: int):
-        """Normalisasi field NAM menjadi angka zero-padded dengan panjang tetap."""
         text_value = str(value).strip()
         if text_value[:1] in {'C', 'D'}:
             text_value = text_value[1:]
@@ -889,7 +868,7 @@ def dag_postingfile():
                 where qtlt.rrn = any(%(rrns)s)
             """
             logging.info(f'Executing query batch {i // chunk_size + 1}, size: {len(batch)}')
-            rows = db_enrichment.read_polar_with_exec(sql=get_qris_query, connection_id=config['db_acq'], params={'rrns': batch})
+            rows = db_enrichment.read_polar_with_exec(sql=get_qris_query, connection_id=config.get('db_acq'), params={'rrns': batch})
             for row in rows:
                 rrn = row[0]
                 if rrn not in qris_data:

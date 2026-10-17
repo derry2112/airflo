@@ -1,0 +1,340 @@
+import logging
+import time
+from typing import Generator
+
+from dags.utils.hooks.SFTPHookOcbc import SFTPHookOcbc
+from dags.utils.str_utils import StrUtils
+import polars as pl
+import io
+from openpyxl import load_workbook
+from collections import deque
+
+class SftpHook:
+    def __init__(self):
+        self.logger = logging.getLogger(__name__)
+
+    def put(self, file_path:str="", destination_path:str="", sftp_conn_id:str=""):
+        """
+        Docstring for putting file to destination
+
+        :param file_path: Path of local file in OCP
+        :type file_path: str
+        :param destination_path: Destination Path in FTP.
+        :type destination_path: str
+        :param sftp_conn_id: FTP Connection ID
+        :type sftp_conn_id: str
+        """
+        sftp_hook = SFTPHookOcbc(ssh_conn_id=sftp_conn_id)
+
+        with sftp_hook.get_conn() as sftp_conn:
+            sftp_conn.put(file_path, destination_path)
+
+    def get(self, file_path:str="", destination_path:str="", sftp_conn_id:str=""):
+        """
+        Docstring for download file to airflow Persistent Volume
+
+        :param file_path: File path in remote
+        :type file_path: str
+        :param destination_path: Destination Path in persistent volume.
+        :type destination_path: str
+        :param sftp_conn_id: SFTP Connection ID
+        :type sftp_conn_id: str
+        """
+        sftp_hook = SFTPHookOcbc(ssh_conn_id=sftp_conn_id)
+
+        with sftp_hook.get_conn() as sftp_conn:
+            sftp_conn.get(file_path, destination_path)
+
+    def copy(self, source_path: str, destination_path: str, sftp_conn_id: str):
+        """
+        Copy a file to another location on the same SFTP server
+        (remote to remote over a single connection).
+
+        Args:
+            source_path: Source file path in SFTP.
+            destination_path: Destination file path in SFTP.
+            sftp_conn_id: SFTP Connection ID
+        """
+        str_utils = StrUtils()
+        if str_utils.isEmpty(source_path) or str_utils.isEmpty(destination_path) or str_utils.isEmpty(sftp_conn_id):
+            raise ValueError("Source Path, Destination Path and SFTP Connection ID must be filled")
+
+        self.logger.info(f"[LOGGING] - [SFTP COPY] Copying {source_path} to {destination_path}")
+
+        sftp_hook = SFTPHookOcbc(ssh_conn_id=sftp_conn_id)
+
+        with sftp_hook.get_conn() as sftp_conn, \
+                sftp_conn.open(source_path, "rb") as src_file, \
+                sftp_conn.open(destination_path, "wb") as dst_file:
+            while True:
+                chunk = src_file.read(1024 * 1024)
+                if not chunk:
+                    break
+                dst_file.write(chunk)
+
+        self.logger.info(f"[LOGGING] - [SFTP COPY] Copy finished: {destination_path}")
+
+    def cut(self, source_path: str, destination_path: str, sftp_conn_id: str):
+        """
+        Cut (move) a file to another location on the same SFTP server
+        (remote to remote over a single connection, source removed after copy).
+
+        Args:
+            source_path: Source file path in SFTP.
+            destination_path: Destination file path in SFTP.
+            sftp_conn_id: SFTP Connection ID
+        """
+        str_utils = StrUtils()
+        if str_utils.isEmpty(source_path) or str_utils.isEmpty(destination_path) or str_utils.isEmpty(sftp_conn_id):
+            raise ValueError("Source Path, Destination Path and SFTP Connection ID must be filled")
+
+        self.logger.info(f"[LOGGING] - [SFTP CUT] Cutting {source_path} to {destination_path}")
+
+        sftp_hook = SFTPHookOcbc(ssh_conn_id=sftp_conn_id)
+
+        with sftp_hook.get_conn() as sftp_conn:
+            with sftp_conn.open(source_path, "rb") as src_file, \
+                    sftp_conn.open(destination_path, "wb") as dst_file:
+                while True:
+                    chunk = src_file.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    dst_file.write(chunk)
+
+            sftp_conn.remove(source_path)
+
+        self.logger.info(f"[LOGGING] - [SFTP CUT] Cut finished: {source_path} moved to {destination_path}")
+
+    def write_lines(self, lines: list, destination_path: str = "", sftp_conn_id: str = ""):
+        """
+        Write a list of strings directly to a remote file on SFTP, one string per line.
+        Missing parent directories on SFTP are created automatically.
+
+        Args:
+            lines: List of strings to write, one per line
+            destination_path: (Optional) Destination file path in SFTP.
+            sftp_conn_id: (Optional) SFTP Connection ID
+        """
+        str_utils = StrUtils()
+        if str_utils.isEmpty(destination_path) or str_utils.isEmpty(sftp_conn_id):
+            raise ValueError("Destination Path and SFTP Connection ID must be filled")
+
+        self.logger.info(f"[SFTP WRITE] Writing {len(lines)} lines to {destination_path}")
+
+        sftp_hook = SFTPHookOcbc(ssh_conn_id=sftp_conn_id)
+
+        with sftp_hook.get_conn() as sftp_conn:
+            remote_file = sftp_conn.open(destination_path, "wb")
+            for line in lines:
+                remote_file.write((line + "\n").encode("utf-8"))
+            remote_file.close()
+
+        self.logger.info(f"[SFTP WRITE] Finished writing {len(lines)} lines to {destination_path}")
+
+    def file_exists(self, sftp_path: str, sftp_conn_id: str) -> bool:
+        """
+        Check if a file exists on SFTP.
+
+        Args:
+            sftp_path: (Optional) Remote file path in SFTP.
+            sftp_conn_id: (Optional) SFTP Connection ID
+
+        Returns:
+            bool: True if file exists, else False
+        """
+        str_utils = StrUtils()
+        if str_utils.isEmpty(sftp_path) or str_utils.isEmpty(sftp_conn_id):
+            raise ValueError("SFTP Path and SFTP Connection ID must be filled")
+
+        sftp_hook = SFTPHookOcbc(ssh_conn_id=sftp_conn_id)
+
+        with sftp_hook.get_conn() as sftp_conn:
+            try:
+                sftp_conn.stat(sftp_path)
+                self.logger.info(f"[LOGGING] - [SFTP CHECK] File exists: {sftp_path}")
+                return True
+            except OSError:
+                self.logger.info(f"[LOGGING] - [SFTP CHECK] File not found: {sftp_path}")
+                return False
+
+    def delete_file(self, sftp_path: str, sftp_conn_id: str):
+        """
+        Delete a file from SFTP.
+
+        Args:
+            sftp_path: Remote file path in SFTP.
+            sftp_conn_id: SFTP Connection ID
+        """
+        str_utils = StrUtils()
+        if str_utils.isEmpty(sftp_path) or str_utils.isEmpty(sftp_conn_id):
+            raise ValueError("SFTP Path and SFTP Connection ID must be filled")
+
+        if not self.file_exists(sftp_path=sftp_path, sftp_conn_id=sftp_conn_id):
+            self.logger.info(f"[LOGGING] - [SFTP DELETE] File not found, nothing to delete: {sftp_path}")
+            return
+
+        sftp_hook = SFTPHookOcbc(ssh_conn_id=sftp_conn_id)
+
+        with sftp_hook.get_conn() as sftp_conn:
+            sftp_conn.remove(sftp_path)
+
+        self.logger.info(f"[LOGGING] - [SFTP DELETE] File deleted: {sftp_path}")
+
+    def read_fixed_width(self, remote_path: str, layout: list, sftp_conn_id: str, error_layout: list | None = None) -> tuple[pl.DataFrame, str]:
+        """
+        Read a fixed-width file directly from SFTP (streamed, no local temp file)
+        and parse it into a Polars DataFrame.
+
+        The file can match one of two record layouts: `layout` (validation
+        succeeded, detail data) or `error_layout` (validation failed, 1 line).
+        The matching layout is detected from the record length of the lines.
+
+        Args:
+            remote_path: File path in SFTP
+            layout: Ordered list of (column_name, length) tuples.
+            sftp_conn_id: SFTP Connection ID
+            error_layout: (Optional) Ordered list of (column_name, length) tuples
+                for the validation-failed file format.
+
+        Returns:
+            tuple: (pl.DataFrame, str) - Parsed DataFrame and detected record
+                type ("success" or "error")
+        """
+
+        self.logger.info(f"[LOGGING] - [SFTP READ_FIXED_WIDTH] Reading {remote_path} directly from SFTP")
+
+        sftp_hook = SFTPHookOcbc(ssh_conn_id=sftp_conn_id)
+
+        with sftp_hook.get_conn() as sftp_conn:
+            lines = []
+            with sftp_conn.open(remote_path, "rb") as remote_file:
+                for line_bytes in remote_file:
+                    line_str = line_bytes.decode("utf-8", errors="replace").rstrip("\r\n")
+                    if line_str.strip():
+                        lines.append(line_str)
+
+        self.logger.info(f"[LOGGING] - [SFTP READ_FIXED_WIDTH] All lines before parse ({len(lines)} lines):")
+        self.logger.info("[LOGGING] - RAW\n" + "\n".join(lines))
+
+        df, record_type = self.parse_fixed_width_lines(lines=lines, layout=layout, error_layout=error_layout)
+
+        self.logger.info(f"[LOGGING] - [SFTP READ_FIXED_WIDTH] Parsed {df.height} rows ({record_type}) from {remote_path}")
+        return df, record_type
+
+    def read_fixed_width_to_dict(self, remote_path: str, header_schema: dict, details_schema: dict, trailer_schema: dict, sftp_conn_id: str) -> dict:
+        """
+        Read a fixed-width file directly from SFTP (streamed, no local temp file)
+        and parse it into a dict of Polars DataFrames based on rec_id
+        (1 = header, 2 = detail, 9 = trailer).
+
+        Args:
+            remote_path: File path in SFTP.
+            header_schema: Schema for header records, {column: (start, length)} with 1-based start.
+            details_schema: Schema for detail records, {column: (start, length)} with 1-based start.
+            trailer_schema: Schema for trailer records, {column: (start, length)} with 1-based start.
+            sftp_conn_id: SFTP Connection ID
+
+        Returns:
+            dict: {"header": pl.DataFrame, "details": pl.DataFrame, "trailer": pl.DataFrame}
+        """
+
+        self.logger.info(f"[LOGGING] - [SFTP READ_FIXED_WIDTH_DICT] Reading {remote_path} directly from SFTP")
+
+        sftp_hook = SFTPHookOcbc(ssh_conn_id=sftp_conn_id)
+
+        with sftp_hook.get_conn() as sftp_conn:
+            lines = []
+            with sftp_conn.open(remote_path, "rb") as remote_file:
+                for line_bytes in remote_file:
+                    line_str = line_bytes.decode("utf-8", errors="replace").rstrip("\r\n")
+                    if line_str.strip():
+                        lines.append(line_str)
+
+        if not lines:
+            raise ValueError(f"File {remote_path} is empty")
+
+        self.logger.info(f"[LOGGING] - [SFTP READ_FIXED_WIDTH_DICT] All lines before parse ({len(lines)} lines):")
+        self.logger.info("[LOGGING] - RAW\n" + "\n".join(lines))
+
+        df = pl.DataFrame({"_raw": lines})
+        df = df.with_columns(
+            pl.col("_raw").str.slice(0, 1).alias("rec_id")
+        )
+
+        result = {
+            "header": None,
+            "details": None,
+            "trailer": None
+        }
+
+        # Parse HEADER
+        df_header = df.filter(pl.col("rec_id") == "1")
+        if header_schema:
+            for col_name, (start, length) in header_schema.items():
+                df_header = df_header.with_columns(
+                    pl.col("_raw").str.slice(start - 1, length).str.strip_chars().alias(col_name)
+                )
+        result["header"] = df_header
+
+        # Parse DETAIL
+        df_details = df.filter(pl.col("rec_id") == "2")
+        if details_schema:
+            for col_name, (start, length) in details_schema.items():
+                df_details = df_details.with_columns(
+                    pl.col("_raw").str.slice(start - 1, length).str.strip_chars().alias(col_name)
+                )
+        result["details"] = df_details
+
+        # Parse TRAILER
+        df_trailer = df.filter(pl.col("rec_id") == "9")
+        if trailer_schema:
+            for col_name, (start, length) in trailer_schema.items():
+                df_trailer = df_trailer.with_columns(
+                    pl.col("_raw").str.slice(start - 1, length).str.strip_chars().alias(col_name)
+                )
+        result["trailer"] = df_trailer
+
+        # Add row numbers
+        result["header"] = result["header"].with_columns(
+            pl.int_range(0, pl.len()).alias("row_number")
+        )
+        result["details"] = result["details"].with_columns(
+            pl.int_range(0, pl.len()).alias("row_number")
+        )
+        result["trailer"] = result["trailer"].with_columns(
+            pl.int_range(0, pl.len()).alias("row_number")
+        )
+
+        self.logger.info(f"[LOGGING] - [SFTP READ_FIXED_WIDTH_DICT] Parsed:")
+        self.logger.info(f"[LOGGING] - Header: {result['header'].height} records")
+        self.logger.info(f"[LOGGING] - Details: {result['details'].height} records")
+        self.logger.info(f"[LOGGING] - Trailer: {result['trailer'].height} records")
+
+        return result
+
+    def consume_file_in_sftp_to_dataframe(
+            self, connection_id="",
+            separator="|",
+            sftp_path="",
+            max_rows_per_chunk: int = 50_000,
+            infer_schema_length: int = 100
+    ) -> Generator:
+        """
+        Returns a generator of DataFrames instead of one large DataFrame to prevent OOM.
+        """
+        str_utils = StrUtils()
+        if str_utils.isEmpty(connection_id):
+            raise ValueError("Connection ID must be filled")
+
+        generator = self.__read_large_csv_in_chunks__(
+            connection_id=connection_id,
+            separator=separator,
+            sftp_path=sftp_path,
+            max_rows_per_chunk=max_rows_per_chunk,
+            infer_schema_length=infer_schema_length
+        )
+        # Yield from the generator directly
+        for chunk_df in generator:
+            self.logger.info(f"📦 [SFTP READER] Chunk Preview:")
+            self.logger.info(chunk_df.head(5))
+            yield chunk_df

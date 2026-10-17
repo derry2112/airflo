@@ -13,14 +13,16 @@ services:
       AIRFLOW__CORE__EXECUTION_API_SERVER_URL: "http://localhost:8080/execution/"
       AIRFLOW_CONN_FTP_EBSP: "ftp://airflow:airflow@ftp:21"
       AIRFLOW_CONN_FTP_MII: "ftp://airflow:airflow@ftp:21"
-      # Keterangan: dipakai SFTPHook pada proses QR Recon untuk pengiriman ke PWC.
-      AIRFLOW_CONN_SFTP_PWC_POST: "sftp://airflow:airflow@sftp-pwc:22"
+      # SFTP_MTI, SFTP_EBSP, SFTP_PWC_POST dikelola di metadata/UI Airflow.
+      LOCAL_SFTP_USERNAME: "airflow"
+      LOCAL_SFTP_PASSWORD: "airflow"
       # Database transaksi Way4 yang diakses oleh Connection4WAY.py.
       AIRFLOW_CONN_DB_REKON_UAT: "postgresql://airflow:airflow@postgres:5432/db_rekon_uat"
+      AIRFLOW_CONN_DB_REKON_PWC: '{"conn_type":"oracle","host":"oracle","port":1521,"login":"POWERCARD","password":"powercard","extra":{"service_name":"FREEPDB1"}}'
       POSTINGFILE_S3_BUCKET: postingfile
       POSTINGFILE_S3_CONNECTION: local_s3
       AIRFLOW_CONN_LOCAL_S3: '{"conn_type":"aws","login":"localposting","password":"localposting-dev-secret","extra":{"endpoint_url":"http://s3-local:9000","region_name":"us-east-1","config_kwargs":{"s3":{"addressing_style":"path"}}}}'
-      PYTHONPATH: "/opt/airflow/runtime-compat:/opt/airflow/runtime"
+      PYTHONPATH: "/opt/airflow:/opt/airflow/dags:/opt/airflow/runtime-compat:/opt/airflow/runtime"
     ports:
       - "8080:8080"
     volumes:
@@ -100,6 +102,7 @@ services:
       # Keterangan: user SFTP berada dalam chroot /home/airflow, sehingga target
       # /pwrcard/home/usr/data dipasang di bawah home user agar terlihat via SFTP.
       - ./data/pwrcard:/home/airflow/pwrcard
+      - ./data/ftp-destination/sftpdata:/home/airflow/sftpdata
 
   oracle:
     image: gvenzl/oracle-free:23-slim

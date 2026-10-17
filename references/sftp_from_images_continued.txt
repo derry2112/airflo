@@ -1,0 +1,329 @@
+[Potongan foto: baris 342–598. Baris 342–377 dilengkapi dari foto tambahan.]
+
+    def __read_large_csv_in_chunks__(
+        self,
+        sftp_path: str,
+        connection_id: str = "",
+        separator: str = "|",
+        max_rows_per_chunk: int = 50_000,  # Default 50k baris per chunk (Sangat Hemat RAM)
+        infer_schema_length: int = 100
+    ) -> Generator:
+        """
+        Membaca file CSV besar dari SFTP secara streaming (KOMPATIBEL dengan Airflow 3.1.8).
+
+        CATATAN KOMPATIBILITAS:
+        - Menggunakan smart_open (sudah di requirements.txt) untuk streaming line-by-line.
+        - Polars read_csv digunakan untuk parsing chunk (lebih cepat daripada manual split).
+
+        Args:
+            sftp_path: URL file CSV besar di SFTP.
+            connection_id: ID koneksi SFTP.
+            separator: Separator CSV.
+            max_rows_per_chunk: Maksimal baris per chunk (default: 50k).
+
+        Yields:
+            pl.DataFrame: DataFrame berisi max_rows_per_chunk baris.
+        """
+        str_utils = StrUtils()
+        if str_utils.isEmpty(connection_id) :
+            raise ValueError("Connection ID must be filled")
+
+        self.logger.info(f"[SFTP READER] Starting streaming read for {sftp_path} with chunk size {max_rows_per_chunk:,} rows...")
+        start_time = time.time()
+
+        try:
+            sftp_hook = SFTPHookOcbc(ssh_conn_id=connection_id)
+            with sftp_hook.get_conn() as sftp_conn:
+                file = sftp_conn.open(sftp_path, "rb")
+
+                # Baca header
+                header_line_bytes = file.readline()
+                if not header_line_bytes:
+                    raise ValueError("File CSV is empty")
+
+                # Decode header, replacing invalid UTF-8 bytes
+                header_line_str = header_line_bytes.decode('utf-8', errors='replace')
+
+                # Remove BOM if present
+                if header_line_str.startswith('\ufeff'):
+                    header_line_str = header_line_str[1:]
+
+                columns = [col.strip() for col in header_line_str.strip().split(separator)]
+
+                # Buffer untuk chunk
+                chunk_lines = []
+                rows_in_chunk = 0
+                chunk_count = 0
+
+                for line_bytes in file:
+                    line_str = line_bytes.decode('utf-8', errors='replace')
+                    chunk_lines.append(line_str)
+                    rows_in_chunk += 1
+
+                    if rows_in_chunk >= max_rows_per_chunk:
+                        chunk_count += 1
+                        # Parse chunk dengan Polars (lebih cepat daripada manual)
+                        csv_data = io.StringIO("".join(chunk_lines))
+                        df = pl.read_csv(
+                            csv_data,
+                            separator=separator,
+                            has_header=False,
+                            new_columns=columns,
+                            dtypes={col: pl.Utf8 for col in columns},  # Force String untuk kecepatan
+                            low_memory=True,
+                            truncate_ragged_lines=True,
+                            null_values=["", "NULL", "null", "None"],
+                            quote_char='"',  # AMAN: Handle quoted strings dengan benar (misal: "John "Jack" Doe")
+                            infer_schema_length=infer_schema_length
+                        )
+                        yield df
+                        self.logger.info(f"[SFTP READER] Chunk {chunk_count}: Yielded {df.height:,} rows")
+
+                        # Reset buffer
+                        chunk_lines = []
+                        rows_in_chunk = 0
+
+                # Sisa baris terakhir
+                if chunk_lines:
+                    chunk_count += 1
+                    csv_data = io.StringIO("".join(chunk_lines))
+                    df = pl.read_csv(
+                        csv_data,
+                        separator=separator,
+                        has_header=False,
+                        new_columns=columns,
+                        dtypes={col: pl.Utf8 for col in columns},
+                        low_memory=True,
+                        truncate_ragged_lines=True,
+                        null_values=["", "NULL", "null", "None"],
+                        quote_char='"',  # AMAN: Handle quoted strings dengan benar
+                    )
+                    yield df
+                    self.logger.info(f"[SFTP READER] Final Chunk {chunk_count}: Yielded {df.height:,} rows")
+
+            elapsed = time.time() - start_time
+            self.logger.info(f"[SFTP READER] Streaming read completed in {elapsed:.3f}s. Total chunks: {chunk_count}")
+        except Exception as e:
+            self.logger.error(f"[SFTP READER] Failed to read CSV: {e}")
+            raise RuntimeError(f"[SFTP READER] Failed to read SFTP file: {e}")
+
+        elapsed = time.time() - start_time
+        self.logger.info(f"[SFTP READER] Streaming read completed in {elapsed:.3f}s")
+
+    def count_rows_sftp(self, sftp_path: str, sftp_conn_id: str = "sftp_default") -> int:
+        """
+        Counts rows in an SFTP file without loading it into RAM.
+
+        Args:
+            sftp_path: The remote path to the file (e.g., "/data/file.csv").
+            sftp_conn_id: Airflow connection ID for SFTP.
+
+        Returns:
+            int: Number of data rows (excluding header if it's a CSV).
+        """
+        str_utils = StrUtils()
+        if str_utils.isEmpty(sftp_conn_id):
+            raise ValueError("SFTP Connection ID must be filled")
+
+        self.logger.info(f"[SFTP COUNT] Starting row count for {sftp_path}")
+        row_count = 0
+        has_header = sftp_path.lower().endswith('.csv')
+
+        try:
+            sftp_hook = SFTPHookOcbc(ssh_conn_id=sftp_conn_id)
+
+            # Open in binary mode to handle any encoding safely
+            with sftp_hook.get_conn() as sftp_conn:
+                file = sftp_conn.open(sftp_path, "rb")
+
+                # Skip header if it's a CSV
+                if has_header:
+                    header_line = file.readline()
+                    if not header_line:
+                        raise ValueError("File CSV is empty")
+                    # We don't need to decode the header for counting.
+                    # Just skip it. But if you want to log it:
+                    # self.logger.info(f"Header skipped: {header_line.decode('utf-8', errors='replace').strip()}")
+
+                # Count remaining lines
+                for line in file:
+                    # Skip empty lines (lines with only newline characters)
+                    if line.strip():
+                        row_count += 1
+
+        except Exception as e:
+            self.logger.error(f"[SFTP COUNT] Failed to count rows: {e}")
+            raise RuntimeError(f"[SFTP COUNT] Failed to count SFTP file: {e}")
+
+        self.logger.info(f"[SFTP COUNT] Total data rows found: {row_count}")
+        return row_count
+
+    def parse_fixed_width_lines(self, lines: list, layout: list, error_layout: list | None = None) -> tuple[pl.DataFrame, str]:
+        """
+        Parse a list of fixed-width lines into a Polars DataFrame.
+        All columns are returned as string (whitespace stripped).
+
+        The lines can match one of two record layouts: `layout` (validation
+        succeeded, detail data) or `error_layout` (validation failed).
+        The matching layout is detected from the record length of the lines.
+
+        Args:
+            lines: List of raw fixed-width lines (without newline characters)
+            layout: Ordered list of (column_name, length) tuples
+            error_layout: (Optional) Ordered list of (column_name, length) tuples
+                for the validation-failed file format
+
+        Returns:
+            tuple: (pl.DataFrame, str) - Parsed DataFrame and detected record
+                type ("success" or "error")
+        """
+        if not layout:
+            raise ValueError("Layout must be filled")
+
+        if not lines:
+            raise ValueError("No lines to parse")
+
+        record_length = sum(length for _, length in layout)
+        record_type = "success"
+
+        if error_layout:
+            error_length = sum(length for _, length in error_layout)
+            if error_length == record_length:
+                raise ValueError("error_layout has the same record length as layout, cannot detect format by length")
+
+            lengths_found = sorted({len(ln) for ln in lines})
+
+            padded_error = all(len(ln.rstrip(" ")) <= error_length for ln in lines)
+
+            if lengths_found == [record_length] and not padded_error:
+                record_type = "success"
+            elif lengths_found == [error_length] or padded_error:
+                record_type = "error"
+                layout = error_layout
+                record_length = error_length
+            else:
+                raise ValueError(
+                    f"Cannot detect record format: found line lengths {lengths_found}, "
+                    f"expected {record_length} (success) or {error_length} (error)"
+                )
+            self.logger.info(f"[LOGGING] - [SFTP PARSE_FIXED_WIDTH] Detected record type: {record_type} ({record_length} chars/record)")
+        else:
+            bad_lines = [i for i, ln in enumerate(lines, start=1) if len(ln) != record_length]
+            if bad_lines:
+                raise ValueError(f"Record length != {record_length} at lines: {bad_lines[:5]}")
+
+        df = pl.DataFrame({"_raw": lines})
+
+        offset = 0
+        for name, length in layout:
+            df = df.with_columns(
+                pl.col("_raw").str.slice(offset, length).str.strip_chars().alias(name)
+            )
+            offset += length
+
+        df = df.drop("_raw")
+
+        return df, record_type
+
+    def consume_excel_in_sftp(
+            self, connection_id="",
+            sheet_name=None,
+            sftp_path="",
+            max_rows_per_chunk: int = 50_000,
+            start_row: int = 1,
+            start_column: int = 1,
+            drop_last_rows: int=0
+    ) -> Generator:
+        """
+        Returns a generator of DataFrames instead of one large DataFrame to prevent OOM.
+        """
+        str_utils = StrUtils()
+        if str_utils.isEmpty(connection_id) :
+            raise ValueError("Connection ID must be filled")
+
+        generator = self.__read_excel_from_sftp__(
+            connection_id=connection_id,
+            sftp_path=sftp_path,
+            sheet_name=sheet_name,
+            max_rows_per_chunk=max_rows_per_chunk,
+            start_column=start_column,
+            start_row=start_row,
+            drop_last_rows= drop_last_rows
+        )
+        # Yield from the generator directly
+        for chunk_df in generator:
+            self.logger.info(f"📦 [SFTP READER] Chunk Preview:")
+            self.logger.info(chunk_df.head(5))
+            yield chunk_df
+
+    def __read_excel_from_sftp__(self, sftp_path: str,connection_id: str,sheet_name:str,max_rows_per_chunk:int=50_000,start_row: int = 1,start_column: int = 1,drop_last_rows: int=0):
+
+        """
+        Membaca file excel dari SFTP secara streaming
+
+        Args:
+            sftp_path: URL file excel di SFTP.
+            connection_id: ID koneksi SFTP.
+            max_rows_per_chunk: Maksimal baris per chunk (default: 50k).
+            start_row: start row dari excel default 1
+            start_column: start column dari excel default 1
+            sheet_name: sheet yang ingin dibaca
+
+        Yields:
+            pl.DataFrame: DataFrame berisi max_rows_per_chunk baris.
+        """
+        str_utils = StrUtils()
+        if str_utils.isEmpty(connection_id) :
+            raise ValueError("Connection ID must be filled")
+
+        self.logger.info(f"[SFTP READER] Starting streaming read for {sftp_path} with chunk size {max_rows_per_chunk:,} rows...")
+        start_time = time.time()
+
+        try:
+            with SFTPHookOcbc(ssh_conn_id=connection_id).get_conn() as sftp_conn:
+                file_bytes = io.BytesIO(sftp_conn.open(sftp_path, "rb").read())
+
+            wb = load_workbook(file_bytes, read_only=True, data_only=True, keep_links=False)
+            ws = wb[sheet_name] if sheet_name else wb.active
+            self.logger.info(f"[SFTP READER] '{ws.title}': {ws.max_row}x{ws.max_column}")
+
+            buffer = deque(maxlen=drop_last_rows)   # holds the trailing rows to discard
+            chunk_rows, rows_in_chunk, chunk_count = [], 0, 0
+
+            def flush(row):
+                nonlocal chunk_rows, rows_in_chunk, chunk_count
+                chunk_rows.append(row)
+                rows_in_chunk += 1
+                if rows_in_chunk >= max_rows_per_chunk:
+                    chunk_count += 1
+                    yielded = chunk_rows
+                    chunk_rows, rows_in_chunk = [], 0
+                    return yielded
+                return None
+
+            for row in ws.iter_rows(min_row=start_row, min_col=start_column, values_only=True):
+                if drop_last_rows > 0:
+                    if len(buffer) == buffer.maxlen:   # buffer full -> oldest is safe to emit
+                        parked = buffer.popleft()
+                        out = flush(parked)
+                        if out is not None:
+                            yield out
+                    buffer.append(row)                # park the current row
+                else:
+                    out = flush(row)
+                    if out is not None:
+                        yield out
+
+            # buffer now holds the last 'drop_last_rows' rows -> intentionally dropped
+            if chunk_rows:
+                chunk_count += 1
+                yield chunk_rows
+
+            wb.close()
+            file_bytes.close()
+        except Exception as e:
+            self.logger.error(f"[SFTP READER] Failed to read CSV: {e}")
+            raise RuntimeError(f"[SFTP READER] Failed to read SFTP file: {e}")
+
+        elapsed = time.time() - start_time
+        self.logger.info(f"[SFTP READER] Streaming read completed in {elapsed:.3f}s")

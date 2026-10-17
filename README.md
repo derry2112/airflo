@@ -326,7 +326,7 @@ lihat source aktif dan spesifikasi bisnis sebelum memakai tabel lama.
 <summary>Buka dokumentasi lama</summary>
 
 Username: admin
-Password: U5gxR5BQYXYEaAc5
+Password: sDmt3qqUFFsn8xUz
 # Airflow Project (tanpa Docker)
 
 Starter project Apache Airflow 3 untuk development lokal, berjalan langsung di
@@ -540,3 +540,17 @@ TR
 | Batch Number | Auto-generated dan saat ini dimulai dari `00000001` | Perlu dipastikan scope increment: per merchant, per file, per terminal, atau per hari. |
 
 </details>
+
+### Instalasi package dari wheel lokal
+
+Wheel Airflow 3.1.7 dan dependensi proyek untuk Python 3.12/Linux x86_64 disimpan di `pkgs/`. Dockerfile menggunakan `pip install --no-index --find-links=/tmp/pkgs` agar instalasi package saat build memakai file lokal.
+
+```bash
+# Unduh wheel dan buat lock versi (memerlukan internet):
+bash scripts/download-pkgs.sh
+# Pasang wheel ke image, lalu terapkan image baru:
+docker compose build airflow
+docker compose up -d --no-deps airflow
+```
+
+Base image Airflow tetap harus tersedia di Docker. Rincian ada di [pkgs/README.md](pkgs/README.md).
