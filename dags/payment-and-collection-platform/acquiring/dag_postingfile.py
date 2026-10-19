@@ -514,7 +514,8 @@ def dag_postingfile():
         sequence_number = 1
         transaction_sequence = 0
         voucher_sequence = 0
-        posting_lines = [_generate_hr_record(header).rstrip('\n')]
+        # posting_lines = [_generate_hr_record(header).rstrip('\n')]
+        posting_lines = [_generate_hr_record(header, posting_directory=os.path.dirname(full_path)).rstrip('\n')]
         for (mid, _mpan, _terminal_id), records in grouped_records.items():
             first_rec = records[0]
             transaction_sequence = 0
@@ -537,12 +538,46 @@ def dag_postingfile():
             expected_length = expected_lengths.get(line[:2])
             if expected_length is None or len(line) != expected_length:
                 raise ValueError(f'Invalid {line[:2]} record length: {len(line)}, expected {expected_length}')
-        with open(full_path, 'w', encoding='utf-8') as generated_file:
+        # with open(full_path, 'w', encoding='utf-8') as generated_file:
+        # Jangan menimpa file sebelumnya jika timestamp nama file sama.
+        with open(full_path, 'x', encoding='utf-8') as generated_file:
             generated_file.write(full_containt)
         logging.info('Posting batch generated: %s | groups=%s | transactions=%s | records=%s', full_path, len(grouped_records), voucher_sequence, len(posting_lines))
         return full_path
 
-    def _generate_hr_record(header=None):
+    def _next_posting_file_sequence(today_yymmdd, institution_ref, posting_directory=None):
+        # Scan juga subfolder tanggal agar nomor tetap berlanjut pada run berikutnya.
+        directories = {os.path.abspath(config['result_local_path_PWC'])}
+        if posting_directory is not None:
+            directories.add(os.path.abspath(posting_directory))
+        last_sequence_number = 0
+        for directory in directories:
+            if not os.path.exists(directory):
+                continue
+            def raise_scan_error(error):
+                raise error
+            for root, _dirs, filenames in os.walk(directory, onerror=raise_scan_error):
+                for filename in filenames:
+                    if not fnmatch.fnmatchcase(filename, 'POSTFLIN_*.txt'):
+                        continue
+                    filepath = os.path.join(root, filename)
+                    # Hanya baca record HR, bukan seluruh transaksi.
+                    with open(filepath, 'r', encoding='utf-8') as posting_file:
+                        hr_record = posting_file.readline(49).rstrip('\r\n')
+                    if len(hr_record) != 47 or not hr_record.startswith('HR'):
+                        continue
+                    if hr_record[10:16] != institution_ref:
+                        continue
+                    file_ref = hr_record[16:32]
+                    if (file_ref.startswith('PTIN') and file_ref[10:] == today_yymmdd
+                            and file_ref[4:10].isascii() and file_ref[4:10].isdigit()):
+                        last_sequence_number = max(last_sequence_number, int(file_ref[4:10]))
+        if last_sequence_number >= 999999:
+            raise ValueError(f'Nomor PTIN untuk tanggal {today_yymmdd} sudah mencapai 999999')
+        return last_sequence_number + 1
+
+    # def _generate_hr_record(header=None):
+    def _generate_hr_record(header=None, posting_directory=None):
         record_type = 'HR'
         last_sequence_number = 0
         this_sequence = last_sequence_number + 1
@@ -550,7 +585,9 @@ def dag_postingfile():
         bank_code_id = _posting_field('HR', 'institution_ref', 6)
         institution_ref = _pad_with_spaces(bank_code_id, 6)
         today_yymmdd = _pad_with_spaces(_get_today_yymmdd(), 6)
-        ptidn = _pad_with_spaces(_to_padded_number(6, this_sequence), 6)
+        # ptidn = _pad_with_spaces(_to_padded_number(6, this_sequence), 6)
+        file_sequence = _next_posting_file_sequence(today_yymmdd, institution_ref, posting_directory)
+        ptidn = _pad_with_spaces(_to_padded_number(6, file_sequence), 6)
         file_ref_value = f'PTIN{ptidn}{today_yymmdd}'
         file_ref = _pad_with_spaces(file_ref_value, 16)
         recon_date = str(header.recon_file_date).strip() if header else ''
