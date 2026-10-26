@@ -1,9 +1,10 @@
 """PostgreSQL utility with explicitly selected Airflow connections."""
 
-from airflow.providers.postgres.hooks.postgres import PostgresHook
+from dags.utils.base_sql import BaseSQL
 
 
 class PostgresEtlHook:
     def read_polar_with_exec(self, sql, connection_id, params=None):
-        hook = PostgresHook(postgres_conn_id=connection_id)
-        return hook.get_records(sql=sql, parameters=params)
+        return BaseSQL().read_polar_with_exec(
+            sql=sql, connection_id=connection_id, params=params
+        ).rows()

@@ -128,6 +128,7 @@ docker compose exec -T postgres psql -v ON_ERROR_STOP=1 -U airflow -d postgres <
 | `03_ensure_way4_query_columns.sql` | Menambahkan kolom query yang belum tersedia |
 | `04_seed_way4_qr_test.sql` | Seed 12 baris untuk hari ini dan kemarin, Asia/Jakarta |
 | `05_qris_enrichment_local.sql` | Membuat DB `db_acq_psql`, tabel `merchant_tm` dan `qris_transaction_log_tt` |
+| `06_seed_onus_local.sql` | Fixture ONUS dan enrichment untuk hari ini, kemarin, serta 19 Oktober 2026 |
 
 Seed 04 mencakup CH Payment/Credit RC 0 serta RC 68/82 dengan Retail pendukung:
 query menghasilkan 4 transaksi per tanggal. Script 05 menyediakan RRN historis **11–12 September 2026** serta enrichment
@@ -137,6 +138,56 @@ script 04 dan 05 saat menguji pada hari lain.
 Oracle menginisialisasi `oracle/init/01_powercard.sql` pada database baru.
 Lookup merchant Rintis membutuhkan MPAN yang cocok dengan `MER_ACCEPTOR_POINT`;
 seed saat ini hanya menyediakan satu pasangan merchant contoh.
+
+Untuk konfigurasi `dag_postingfile` yang memakai `source_connection_type = SFTP`,
+input harus tersedia di `data/pwrcard/home/usr/data/ACQ/MTI/ClearingRintisQRIS/`.
+File di `data/ACQ_MTI/ClearingRintisQRIS/` hanya tersedia lewat FTP dan tidak otomatis
+terbaca oleh koneksi SFTP. Nama file harus cocok dengan mask tanggal di DAG.
+Status run sukses dengan daftar `Unprocessed files: []` berarti belum ada input yang diproses.
+User SFTP lokal memiliki UID 1000; direktori tujuan MTI juga harus dapat ditulis oleh user tersebut.
+
+### Data ONUS lokal dan query
+
+Jalur ONUS menggunakan transaksi Way4 pada `sw_replicate.on_doc_transaction`.
+Fixture tambahan tersedia di [`06_seed_onus_local.sql`](postgres/init/06_seed_onus_local.sql),
+termasuk enrichment pada `db_acq_psql`. Jalankan setelah script 03 dan 05:
+
+```bash
+docker compose exec -T postgres psql -v ON_ERROR_STOP=1 -U airflow -d db_rekon_uat < postgres/init/06_seed_onus_local.sql
+```
+
+Script dapat dijalankan ulang tanpa menggandakan fixture. Tanggal fixture adalah
+hari ini, kemarin (Asia/Jakarta), dan 19 Oktober 2026 agar cocok dengan contoh QR Recon.
+Per tanggal tersedia enam baris sumber: empat transaksi ONUS dan dua Retail pendukung.
+MPAN enrichment memakai merchant PWC lokal `9360002801111177646`; MID `111117764535`.
+
+| Jenis | RC | Nominal | Hasil query |
+|---|---|---:|---|
+| CH Payment | 0 | 10.000 | Debit |
+| Credit | 0 | 20.000 | Kredit |
+| CH Payment | 68 | 30.000 | Debit, didukung Retail RC 0/reversal 0 dengan RRN sama |
+| Credit | 82 | 40.000 | Kredit, didukung Retail RC 0/reversal 0 dengan RRN sama |
+
+Query yang digunakan disimpan di [`onus_way4.sql`](references/sql/onus_way4.sql).
+Kolom dan filter disalin dari `_get_way4_data_new` pada `dag_postingfile.py`;
+placeholder hanya diubah ke format `psql` agar dapat dijalankan langsung:
+
+```bash
+docker compose exec -T postgres psql -v ON_ERROR_STOP=1 -U airflow -d db_rekon_uat -v period=20261019 -v pan_prefix='936000281%' < references/sql/onus_way4.sql
+```
+
+Query mengambil `connection_acq = 'T'`, issuer `ACQQR/a/O`, PAN berawalan
+`936000281`, serta CH Payment/Credit dengan RC 0 atau RC 68/82 yang memiliki
+Retail sukses. Query juga mengambil fixture lain yang memenuhi filter tersebut;
+fixture ONUS tambahan memiliki RRN tanggal + suffix `910001`, `910002`, `910003`, `910005`.
+DAG saat ini mengisi parameter tanggal query dengan **kemarin menurut waktu proses**,
+meskipun tanggal file/logical date berbeda. Penambahan fixture ini tidak mengubah aturan itu.
+
+Contoh POSTFLIN khusus ONUS dibuat di `data/pwrcard/home/usr/data/onus/` dengan
+nama `POSTFLIN_ONUS_SAMPLE_20261019.txt`. File contoh berisi
+empat transaksi (dua debit dan dua kredit), menggunakan generator dan lookup merchant
+DAG yang sama. Ini artefak uji lokal; alur DAG utama tetap menggabungkan Way4 dan Rintis
+pada POSTFLIN PWC sesuai implementasi existing.
 
 ## 4. Airflow Connections
 
@@ -554,3 +605,33 @@ docker compose up -d --no-deps airflow
 ```
 
 Base image Airflow tetap harus tersedia di Docker. Rincian ada di [pkgs/README.md](pkgs/README.md).
+
+### Memindahkan period ONUS untuk uji pada database existing
+
+Gunakan [onus_update_period_existing.sql](references/sql/onus_update_period_existing.sql)
+pada database Way4. Ganti `source_period` dan daftar RRN dengan transaksi yang akan diuji.
+`target_period` default adalah kemarin di Asia/Jakarta; sesuaikan dengan tanggal yang
+benar-benar dihitung proses Airflow existing (`datetime.today() - timedelta(days=1)`).
+Script tidak bergantung pada marker dummy `add_data` dan tidak menambahkan data baru.
+
+Script menampilkan data sebelum perubahan, melewati RRN/jenis transaksi yang sudah
+ada pada tanggal tujuan, memperbarui `period` untuk transaksi terpilih beserta Retail
+pendukungnya, lalu menampilkan transaksi yang lolos filter ONUS. Default akhir adalah
+`ROLLBACK`; setelah preview sesuai, ubah baris terakhir menjadi `COMMIT` dan jalankan
+ulang seluruh file untuk menyimpan perubahan. Simpan hasil preview sebagai catatan
+`docid` dan tanggal asal. Contoh menjalankan preview di lingkungan lokal:
+
+```bash
+docker compose exec -T postgres psql -v ON_ERROR_STOP=1 -U airflow -d db_rekon_uat < references/sql/onus_update_period_existing.sql
+```
+
+Jalankan [onus_check_enrichment_existing.sql](references/sql/onus_check_enrichment_existing.sql)
+secara terpisah pada database enrichment, dengan daftar RRN yang sama. Jalankan
+[onus_check_merchant_existing.sql](references/sql/onus_check_merchant_existing.sql)
+pada Oracle PWC, mengisi bind `:mpan` dari hasil enrichment. Tidak ada perubahan data
+pada kedua query pengecekan tersebut. `MERCHANT_NUMBER` wajib terisi dan valid sesuai
+validasi DAG. Update `period` tidak mengubah RRN sehingga enrichment memakai RRN existing.
+
+Sesudah perubahan disimpan, pastikan file QR Recon berada di source FTP/SFTP yang
+benar dan nama file sesuai mask tanggal run. ONUS saat ini diproses saat DAG menemukan
+input QR Recon; update database saja tidak menghasilkan POSTFLIN ketika daftar input kosong.

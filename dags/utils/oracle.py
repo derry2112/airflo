@@ -1,9 +1,10 @@
 """Oracle utility with explicitly selected Airflow connections."""
 
-from airflow.providers.oracle.hooks.oracle import OracleHook
+from dags.utils.base_sql import BaseSQL
 
 
 class OracleEtlHook:
     def read_polar_with_exec(self, sql, connection_id, params=None):
-        hook = OracleHook(oracle_conn_id=connection_id)
-        return hook.get_records(sql=sql, parameters=params)
+        return BaseSQL().read_polar_with_exec(
+            sql=sql, connection_id=connection_id, params=params
+        ).rows()

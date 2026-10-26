@@ -7,7 +7,7 @@ from typing import List, NamedTuple
 from dags.utils.telemetry.tracing import tracer
 from dags.utils.ftp import FTPHookOcbc
 from dags.utils.sftp import SftpHook, SFTPHookOcbc
-from dags.utils.postgres import PostgresEtlHook
+from dags.utils.postgres import PostgresEtlHook as PostgrestEtlHook
 from dags.utils.oracle import OracleEtlHook
 from dags.utils.callback import Callback
 from dags.utils.models.model_postingfile import ReconHeader, ReconRecordData
@@ -53,9 +53,9 @@ class ProcessDataMap(NamedTuple):
 
 logger = logging.getLogger(__name__)
 sftp = SftpHook()
-db_way4 = PostgresEtlHook()
+db_way4 = PostgrestEtlHook()
 db_source = OracleEtlHook()
-db_enrichment = PostgresEtlHook()
+db_enrichment = PostgrestEtlHook()
 
 config = {'posting_settings': {'space': ' ',
                       'merchant_outlet_spaces': 0,
@@ -261,7 +261,7 @@ def dag_postingfile():
     def _process_file_mask(outgoing_file_name=''):
         date = _file_date() + timedelta(hours=9)
         mask = outgoing_file_name or config['file_name_mask']
-        return mask.replace('.dsj', date.strftime(config['format_date'])).split('|')
+        return mask.replace('.dsj', date.strftime('%y%m%d')).split('|')
 
     def _hook(connection_type, connection_id):
         if connection_type == "FTP":
