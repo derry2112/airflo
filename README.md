@@ -677,3 +677,17 @@ File hasil ekstraksi yang cocok dengan mask pemrosesan juga diarsipkan.
 XCom setiap file yang diproses menyertakan `source_s3_url`. Direktori `local_path`
 tetap menjadi staging ekstraksi/parsing. Backup sebelum perubahan input:
 `backups/dag_postingfile.before_s3_input_20261026_232501.py.bak`.
+
+### DataFrame pada dag_postingfile
+
+Query `dag_postingfile` sekarang meminta `as_dataframe=True` pada hook existing
+PostgreSQL/Oracle. Hook menggunakan `polars.read_database` dan mengembalikan Polars
+DataFrame; pemanggil DAG lain tetap memakai perilaku lama bila opsi tersebut tidak
+diaktifkan. `base_sql.py` dan `s3_artefact.py` tidak diubah untuk integrasi ini.
+
+Data merchant diakses melalui nama kolom (`AP_ON_ID_10`, `MER_ACCEPTOR_POINT_ID`,
+`MERCHANT_NUMBER`), bukan indeks tuple. Enrichment ONUS memakai left join berdasarkan
+RRN, menjaga urutan dan jumlah transaksi; duplikat enrichment memakai hasil pertama.
+Enrichment yang tidak lengkap menghasilkan error dengan daftar RRN terkait.
+Generator fixed-width menerima record bernama, bukan pasangan tuple record/MID.
+Backup sebelum perubahan memiliki suffix `before_dataframe_20261027_071056.bak`.

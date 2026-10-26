@@ -17,6 +17,7 @@ from dags.utils.callback import Callback
 from dags.utils.models.model_postingfile import ReconHeader, ReconRecordData
 from dags.utils.models.airflow_constant import RecordEstimate, StorageEstimate, TimeEstimate
 import logging
+import polars as pl
 import os, fnmatch, glob, shutil, zipfile, sys
 
 _project_root = str(Path(__file__).resolve().parents[3])
@@ -398,18 +399,18 @@ def dag_postingfile():
             logging.info('period: %s', period)
             logging.info('sql: %s', sql)
             logging.info('connection db way4')
-            records = db_way4.read_polar_with_exec(sql=sql, connection_id=config.get('db_way4'), params={'yesterday': yesterday, 'pan_prefix': '936000281%'})
+            records = db_way4.read_polar_with_exec(sql=sql, connection_id=config.get('db_way4'), params={'yesterday': yesterday, 'pan_prefix': '936000281%'}, as_dataframe=True)
             if records is None:
                 logging.warning('way4 get data return None | period=%s | con_acq=%s', period, con_acq)
-                records = []
-            if records and save_result_file:
+                records = pl.DataFrame()
+            if not records.is_empty() and save_result_file:
                 os.makedirs(config['result_local_path_way4'], exist_ok=True)
                 spek_name_pwc = f'POSTFLIN_{timestamp}.txt'
                 result_file = os.path.join(config['result_local_path_way4'], spek_name_pwc)
                 logging.info('Save way4 result to file:%s', result_file)
                 with open(result_file, 'w') as file:
-                    for row in records:
-                        file.write('|'.join(('' if value is None else str(value) for value in row)))
+                    for row in records.iter_rows(named=True):
+                        file.write('|'.join(('' if value is None else str(value) for value in row.values())))
                         file.write('\n')
                 logging.info('way4 result file created:%s | total records:%s', result_file, len(records))
             return records
@@ -453,7 +454,7 @@ def dag_postingfile():
             file_processed = open(str_result_name, 'w')
             file_processed_PWC = open(str_result_pwc, 'w')
             merchants = _get_data_merchant_pwc_qr_acceptor()
-            merchants_pwcs = set((str(row[0]).strip() for row in merchants))
+            merchants_pwcs = set(merchants.get_column('AP_ON_ID_10').cast(pl.String).str.strip_chars().drop_nulls().to_list())
             logging.info('pwc acceptor point: %s', merchants)
             logging.info('merchant_pwcs: %s', merchants_pwcs)
             row_count = 0
@@ -482,10 +483,10 @@ def dag_postingfile():
                         logging.info('========== START CREATE FILE SPLIT ==========')
                         logging.info('Merchants is PWC')
                         mid_records = _get_merchant_by_acceptor_point(mpan)
-                        if not mid_records:
+                        if mid_records.is_empty():
                             logging.info('MID not found for MPAN [%s]', mpan)
                             continue
-                        mid = mid_records[0][0]
+                        mid = mid_records.get_column('MER_ACCEPTOR_POINT_ID').item(0)
                         logging.info('MID record:%s', mid_records)
                         mid = str(mid).strip()
                         logging.info('[QR_RECON][SPLIT] MID dipilih | MPAN=%s | MID=%s | tipe=%s | panjang=%s', mpan, mid, type(mid).__name__, len(mid))
@@ -494,13 +495,13 @@ def dag_postingfile():
                             posting_filename = f'POSTFLIN_{filename_datetime}.txt'
                         filename = posting_filename
                         logging.info('[QR_RECON] Calling create_posting_file | filename:%s | mpan:%s | mid:%s | target_split:%s ', filename, mpan, mid, str_result_pwc)
-                        if len(mid_records[0]) < 2 or mid_records[0][1] is None:
+                        if 'MERCHANT_NUMBER' not in mid_records.columns or mid_records.get_column('MERCHANT_NUMBER').item(0) is None:
                             raise ValueError(f'MERCHANT_NUMBER PWC tidak ditemukan untuk MPAN [{mpan}]')
-                        merchant_number = str(mid_records[0][1]).strip()
+                        merchant_number = str(mid_records.get_column('MERCHANT_NUMBER').item(0)).strip()
                         if not merchant_number.isascii() or not merchant_number.isdigit() or len(merchant_number) > 15:
                             raise ValueError(f'MERCHANT_NUMBER PWC harus berupa angka maksimal 15 digit untuk MPAN [{mpan}]')
                         posting_rec = SimpleNamespace(**rec.dict(), merchant_number=merchant_number)
-                        pwc_posting_records.append((posting_rec, mid))
+                        pwc_posting_records.append({'record': posting_rec, 'mid': mid})
                         logging.info('[QR_RECON][SPLIT] Merchant siap untuk posting | MPAN=%s | MID(MER_ACCEPTOR_POINT_ID)=%s | MERCHANT_NUMBER=%s | panjang_merchant_number=%s | HS.outlet_number=MID | HS.merchant_number=MERCHANT_NUMBER', mpan, mid, merchant_number, len(merchant_number))
                         file_processed_PWC.write(rec.to_line() + '\n')
                         row_count_pwc += 1
@@ -533,10 +534,10 @@ def dag_postingfile():
             logging.info('get data merchant pwc')
             logging.info('executing query: %s', merchant_query)
             logging.info('connection db PWC')
-            records = db_source.read_polar_with_exec(sql=merchant_query, connection_id=config.get('db_source'))
+            records = db_source.read_polar_with_exec(sql=merchant_query, connection_id=config.get('db_source'), as_dataframe=True)
             if records is None:
                 logging.warning('pwc get data return None')
-                records = []
+                records = pl.DataFrame()
             logging.info('final result ap_on_id: %s', records)
             return records
         except Exception as e:
@@ -552,12 +553,12 @@ def dag_postingfile():
             logging.info('[QR_RECON][LOOKUP] Mulai lookup MID dan MERCHANT_NUMBER | tabel=MER_ACCEPTOR_POINT | MPAN=%s', mpan)
             logging.info('sql:%s', sql)
             logging.info('mpan acceptor:%s', mpan)
-            records = db_source.read_polar_with_exec(sql=sql, connection_id=config.get('db_source'), params={'mpan': mpan})
+            records = db_source.read_polar_with_exec(sql=sql, connection_id=config.get('db_source'), params={'mpan': mpan}, as_dataframe=True)
             if records is None:
                 logging.warning('pwc get data return None')
-                records = []
+                records = pl.DataFrame()
             logging.info('[QR_RECON][LOOKUP] Selesai | MPAN=%s | jumlah_baris=%s | urutan_kolom=(MER_ACCEPTOR_POINT_ID, MERCHANT_NUMBER) | hasil=%s', mpan, len(records), records)
-            if not records:
+            if records.is_empty():
                 logging.warning('[QR_RECON][LOOKUP] Merchant tidak ditemukan | MPAN=%s', mpan)
             return records
         except Exception as e:
@@ -571,7 +572,8 @@ def dag_postingfile():
             raise ValueError('filename cannot contain a path')
         full_path = os.path.join(os.path.dirname(target_split), filename)
         grouped_records = {}
-        for rec, mid in posting_records:
+        for posting in posting_records:
+            rec, mid = posting['record'], posting['mid']
             normalized_mid = str(mid).strip()
             group_key = (normalized_mid, str(rec.merchant_pan).strip(), str(rec.terminal_id).strip())
             grouped_records.setdefault(group_key, []).append(rec)
@@ -871,8 +873,7 @@ def dag_postingfile():
         return text_value.zfill(length)
 
     def _map_way4_to_posting_records_new(records):
-        columns = ('merchant_id', 'terminal_id', 'retrieval_reference_number', 'transaction_date', 'transaction_time', 'transaction_amount', 'transaction_amount_currency', 'acquiring_bank_code', 'issuer_bank_code', 'forwarding_institution', 'customer_pan', 'response_code', 'transaction_sign', 'approval_code', 'reversalseq', 'srn', 'stan')
-        records = _get_data_qris_enrichment(records, columns)
+        records = _get_data_qris_enrichment(records)
 
         def text(value, default=''):
             return default if value is None else str(value).strip()
@@ -907,7 +908,7 @@ def dag_postingfile():
                 ProcessingCode = '26'
             return ProcessingCode + from_account + to_account
         posting_records = []
-        for values in records or []:
+        for values in records.iter_rows(named=True):
             mid = text(values.get('merchant_id'))
             if not mid:
                 logging.warning('Skip Way4 record without mid: %s', values)
@@ -939,18 +940,19 @@ def dag_postingfile():
             invoice_number = text(values.get('invoice_number'))
             base_record = ReconRecordData(recon_header='DH', terminal_id=terminal_id[:16].ljust(16), retrieval_reference_number=rrn[:12].ljust(12), merchant_pan=mpan[:19].ljust(19), transaction_date=transaction_date, transaction_time=transaction_time, processing_code=processing_code(transaction_sign, from_account_type, to_account_type), transaction_amount=numeric(values.get('transaction_amount'), 12), convenience_fee=numeric(values.get('fee'), 9), transaction_amount_currency=transaction_currency, merchant_type=merchant_type[:4].ljust(4), merchant_criteria=merchant_criteria[:3].ljust(3), acquiring_bank_code=institution_acq, issuer_bank_code=issuer_bank_code, forwarding_institution_id=' ' * 11, response_code=response_code[:2].ljust(2), customer_pan=cpan[:28].ljust(28), invoice_data=invoice_number[:20].ljust(20), approval_code=authorization_code[:6].ljust(6), message_type_indicator='0200')
             merchant_rows = _get_merchant_by_acceptor_point(mpan)
-            if not merchant_rows or len(merchant_rows[0]) < 2 or merchant_rows[0][1] is None:
+            if merchant_rows.is_empty() or 'MERCHANT_NUMBER' not in merchant_rows.columns or merchant_rows.get_column('MERCHANT_NUMBER').item(0) is None:
                 raise ValueError(f'MERCHANT_NUMBER PWC tidak ditemukan untuk MPAN [{mpan}]')
-            merchant_number = _posting_merchant_number(base_record, merchant_rows[0][1])
+            merchant_number = _posting_merchant_number(base_record, merchant_rows.get_column('MERCHANT_NUMBER').item(0))
             rec = SimpleNamespace(**base_record.dict(), merchant_number=merchant_number, outlet_number=merchant_id, batch_capture_date=period, batch_currency=transaction_currency, reversal_flag=reversal_flag, stan=text(values.get('stan')), transactiontype=text(values.get('transactiontype')))
-            posting_records.append((rec, mid))
+            posting_records.append({'record': rec, 'mid': mid})
         return posting_records
 
-    def _get_data_qris_enrichment(records, columns):
+    def _get_data_qris_enrichment(records: pl.DataFrame) -> pl.DataFrame:
         logging.info('START Get Data QRIS Enrichment')
-        records = [dict(zip(columns, r)) if not isinstance(r, dict) else r for r in records]
-        rrns = [r['retrieval_reference_number'] for r in records]
-        qris_data = {}
+        if records.is_empty():
+            return records
+        rrns = records.get_column('retrieval_reference_number').unique(maintain_order=True).to_list()
+        enrichment_frames = []
         chunk_size = 5000
         for i in range(0, len(rrns), chunk_size):
             batch = rrns[i:i + chunk_size]
@@ -969,17 +971,29 @@ def dag_postingfile():
                 where qtlt.rrn = any(%(rrns)s)
             """
             logging.info(f'Executing query batch {i // chunk_size + 1}, size: {len(batch)}')
-            rows = db_enrichment.read_polar_with_exec(sql=get_qris_query, connection_id=config.get('db_acq'), params={'rrns': batch})
-            for row in rows:
-                rrn = row[0]
-                if rrn not in qris_data:
-                    qris_data[rrn] = {'merchant_criteria': row[1], 'from_account_type': row[2], 'to_account_type': row[3], 'mpan': row[4], 'merchant_type': row[5], 'invoice_number': row[6], 'fee': row[7]}
-        for r in records:
-            match = qris_data.get(r['retrieval_reference_number'])
-            if match:
-                r.update(match)
-        logging.info(f'Finish Get Data QRIS Enrichment, total matched: {len(qris_data)}')
-        return records
+            rows = db_enrichment.read_polar_with_exec(sql=get_qris_query, connection_id=config.get('db_acq'), params={'rrns': batch}, as_dataframe=True)
+            if not rows.is_empty():
+                enrichment_frames.append(rows)
+        if not enrichment_frames:
+            raise ValueError('Enrichment QRIS tidak ditemukan untuk transaksi ONUS')
+        enrichment = pl.concat(enrichment_frames, how='vertical_relaxed').unique(
+            subset=['rrn'], keep='first', maintain_order=True,
+        )
+        result = records.join(
+            enrichment, left_on='retrieval_reference_number', right_on='rrn',
+            how='left', maintain_order='left', validate='m:1',
+        )
+        missing = result.filter(
+            pl.col('from_account_type').is_null()
+            | pl.col('to_account_type').is_null()
+            | pl.col('mpan').is_null()
+        )
+        if not missing.is_empty():
+            raise ValueError(
+                f"Enrichment ONUS tidak lengkap untuk RRN: {missing.get_column('retrieval_reference_number').to_list()}"
+            )
+        logging.info('Finish Get Data QRIS Enrichment, total matched: %s', result.height)
+        return result
     files = get_unprocessed_files()
     processed_files = process_file(files)
     send_file(processed_files)

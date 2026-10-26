@@ -1,20 +1,19 @@
-from __future__ import annotations
-
 # Transcribed from WhatsApp Unknown 2026-10-26 at 22.35.17.zip.
 # Completed with additional photographs supplied in chat on 2026-10-26.
+import ast
 import json
 import logging
 import os
 import time
 import types
-from typing import Any, Dict, Generator, List, TYPE_CHECKING
+from typing import Any, Dict, Generator, List
 
 from airflow.sdk import BaseHook
-from sqlalchemy import Connection
-if TYPE_CHECKING:
-    from dags.utils.BaseDags.BaseDagsClient import ConfigClient
+from sqlalchemy import Connection, PoolProxiedConnection
+from dags.utils.BaseDags.BaseDagsClient import ConfigClient
 from dags.utils.conjur_secret_manager import ConjurSecretManager
 from dags.utils.models.connection_model import ConnectionModel
+from dags.utils.s3_artefact import S3ArtefactHook
 from dags.utils.sftp import SftpHook
 from dags.utils.str_utils import StrUtils
 import polars as pl
@@ -26,16 +25,9 @@ class BaseSQL:
 
     def __init__(self):
         self.str_utils = StrUtils()
-        self._s3_connection = None
+        self.s3_connection = S3ArtefactHook()
         self.logger = logging.getLogger(__name__)
         self.conjur_manager = ConjurSecretManager()
-
-    @property
-    def s3_connection(self):
-        if self._s3_connection is None:
-            from dags.utils.s3_artefact import S3ArtefactHook
-            self._s3_connection = S3ArtefactHook()
-        return self._s3_connection
 
     def __setconnection__(self, connection_id: str = None) -> Connection:
         conn = BaseHook.get_connection(connection_id)
@@ -53,7 +45,19 @@ class BaseSQL:
         return conn_stream
 
     def __setconnection_cursor__(self, connection_id: str = None) -> Connection:
-        return BaseHook.get_connection(connection_id).get_hook().get_conn()
+        conn = BaseHook.get_connection(connection_id)
+        extra_json = json.loads(conn.extra)
+        connection_obj = ConnectionModel(
+            username_dap=extra_json.get('username_dap', ''),
+            password_dap=extra_json.get('password_dap', ''),
+            host=conn.host,
+            port=str(conn.port),
+            schema=conn.schema,
+        )
+        self.logger.info(f'Username DAP: {connection_obj.username_dap}')
+        self.logger.info(f'Password DAP: {connection_obj.password_dap}')
+        conn_stream = PoolProxiedConnection()
+        return conn_stream
 
     def insert_rows(self, config: ConfigClient = None, s3_url: str = '',
                     connection_id: str = None, batch_size: int = 50000,
@@ -67,7 +71,7 @@ class BaseSQL:
         """
         if not config:
             raise ValueError('config must be provided')
-        s3_hook = self.s3_connection
+        s3_hook = S3ArtefactHook()
         sftp_hook = SftpHook()
         rows_count = (
             s3_hook.count_rows_s3(s3_url=s3_url, aws_conn_id='s3-artefact')
@@ -648,36 +652,52 @@ class BaseSQL:
         self.logger.info('Template function')
 
     def read_polar_with_exec(self, sql: str = None, connection_id: str = None, params=None):
-        """Execute SQL with native driver parameters and return a Polars DataFrame."""
         if not sql:
             raise ValueError('sql must be provided')
-        conn_stream = None
-        cursor = None
         try:
             conn_stream = self.__setconnection_cursor__(connection_id=connection_id)
             cursor = conn_stream.cursor()
-            if params is not None:
+            if params:
                 cursor.execute(sql, params)
             else:
                 cursor.execute(sql)
+            self.logger.info('✅ success sql execute')
+            # if cursor.description:
+            #     cursor.fetchall()
+            self.logger.info('✅ check step 1')
             while cursor.description is None:
-                nextset = getattr(cursor, 'nextset', None)
-                if nextset is None or not nextset():
+                try:
+                    if not cursor.nextset():
+                        break
+                except:
                     break
-            if cursor.description is None:
-                data = pl.DataFrame()
-            else:
-                columns = [col[0] for col in cursor.description]
-                rows = [tuple(row) for row in cursor.fetchall()]
-                data = pl.DataFrame(rows, schema=columns, orient='row', infer_schema_length=None)
-            conn_stream.commit()
+            self.logger.info('✅ check step 2')
+            if cursor.description:
+                self.logger.info('✅ check step 3')
+                self.logger.info(f'description cursor : {cursor.description}')
+                columns = [col[0] for col in cursor.description] if cursor.description else []
+                self.logger.info(f'List of column : {columns}')
+                rows = cursor.fetchall()
+                conn_stream.commit()
+                self.logger.info(f'List row : {rows}')
+                rowcounts = len(rows)
+                self.logger.info(f'Total Data : {rowcounts}')
+                if rows:
+                    self.logger.info(f'List row 2 : {rows}')
+                    raw_string = rows[0]
+                    self.logger.info(f'✅ raw string : {raw_string}')
+                    tuples_list = ast.literal_eval(f'[{raw_string}]')
+                    self.logger.info(f'✅ tuple list : {tuples_list}')
+                    data = pl.DataFrame(tuples_list, schema={col: pl.Utf8 for col in columns}, orient='row')
+                    self.logger.info(f'List data : {data}')
+                else:
+                    data = pl.DataFrame(schema={col: pl.Utf8 for col in columns})
+            cursor.close()
+            self.logger.info('✅ success sql commit')
+            conn_stream.close()
             return data
         except Exception as e:
-            if conn_stream is not None:
-                conn_stream.rollback()
-            raise RuntimeError(str(e)) from e
-        finally:
-            self._close_connection(conn_stream, cursor)
+            raise RuntimeError(str(e))
 
     def write_csv_from_chunks(self, chunk_generator: Generator[DataFrame, Any, None] = None,
                               file_path='', separator='|', ext='csv') -> int:

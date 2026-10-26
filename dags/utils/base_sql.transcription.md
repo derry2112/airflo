@@ -25,3 +25,9 @@ Pemeriksaan: sintaks Python berhasil diparse dengan `ast.parse`. Eksekusi/import
 Validasi integrasi: sintaks berhasil; pemeriksaan menggunakan driver dan DataFrame tiruan mencakup penerusan parameter, banyak baris, hasil kosong/tanpa result set, rollback, dan penutupan resource. Eksekusi Airflow/database dan Polars asli belum diuji karena Polars tidak terpasang di interpreter lokal.
 
 Koreksi integrasi: inisialisasi `db_way4 = PostgrestEtlHook()`, `db_source = OracleEtlHook()`, dan `db_enrichment = PostgrestEtlHook()` dipertahankan. `PostgrestEtlHook` di DAG adalah alias impor untuk kelas existing `PostgresEtlHook`. Kedua wrapper hook meneruskan `read_polar_with_exec` ke `BaseSQL` dan mengembalikan `.rows()`, sehingga antarmuka daftar tuple tetap sama bagi semua pemanggil.
+
+## Koreksi: BaseSQL dipertahankan sesuai transkripsi
+
+Sesuai permintaan pengguna, perubahan integrasi pada `base_sql.py` dikembalikan ke versi transkripsi setelah foto tambahan. Metode asli `read_polar_with_exec` kembali memakai `ast.literal_eval` sesuai foto. Versi sebelum pengembalian disimpan di `backups/base_sql.before_restore_20261026_233430.py.bak`.
+
+Hook PostgreSQL/Oracle sekarang menggunakan `get_records` provider masing-masing dan tidak mengimpor atau memanggil `BaseSQL`. Dengan demikian DAG tetap menerima seluruh hasil sebagai daftar tuple beserta nilai Decimal native, tanpa mengubah library BaseSQL existing. Catatan integrasi sebelumnya di atas adalah riwayat perubahan yang sudah dibatalkan. `ConfigClient` yang diimpor versi transkripsi masih belum tersedia di proyek; jalur DAG ini tidak mengimpor BaseSQL.
