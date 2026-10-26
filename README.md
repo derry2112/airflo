@@ -635,3 +635,45 @@ validasi DAG. Update `period` tidak mengubah RRN sehingga enrichment memakai RRN
 Sesudah perubahan disimpan, pastikan file QR Recon berada di source FTP/SFTP yang
 benar dan nama file sesuai mask tanggal run. ONUS saat ini diproses saat DAG menemukan
 input QR Recon; update database saja tidak menghasilkan POSTFLIN ketika daftar input kosong.
+
+### Hasil dag_postingfile melalui S3ArtefactHook
+
+`process_file` mengunggah hasil split Rintis, hasil split PWC, dan POSTFLIN ke S3
+menggunakan `S3ArtefactHook.put_file_to_s3`. Task `send_file` mengunduh objek S3
+ke direktori sementara sebelum mengirimnya ke tujuan FTP/SFTP existing.
+XCom menyertakan `mti_s3_url`, `pwc_s3_url`, dan `posting_s3_urls`.
+
+- `result_local_path` dan `result_local_path_PWC` tetap menjadi staging untuk
+  generator existing dan pemindaian nomor PTIN. File lokal tidak dihapus sesudah upload.
+- `result_s3_app_rintis = data_payment/acquiring/result/rintis`.
+- `result_s3_app_pwc = data_payment/acquiring/result/rintisPWC`.
+- Pola key: `artefacts/<result_s3_app>/<YYYYMMDD>/<run_id>/<nama_file>`.
+  Run terpisah memiliki prefix berbeda agar hasil uji sebelumnya tidak tertimpa.
+- Connection Airflow yang dipakai adalah **`s3-artefact`**, sesuai implementasi
+  `s3_artefact.py`. Isi Extra dengan `bucket`, endpoint/region sesuai lingkungan.
+  Untuk lokal, connection telah diarahkan ke `http://s3-local:9000`, bucket `postingfile`.
+- Adapter `dags/utils/hooks/S3HookOcbc.py` memakai provider AWS Airflow dan
+  menyediakan `conn_extra` yang diperlukan oleh kode hasil transkripsi.
+- `s3_artefact.py` tidak dimodifikasi. DAG memeriksa URL hasil upload karena
+  metode existing menangkap exception sebagai warning; upload gagal harus
+  menggagalkan task, bukan melanjutkan pengiriman file lokal.
+
+Backup sebelum integrasi tersedia di
+`backups/dag_postingfile.before_s3_20261026_232053.py.bak`.
+Untuk existing, siapkan connection `s3-artefact` pada Airflow dan pastikan
+provider AWS, boto3, polars, serta smart_open tersedia. Buat run baru setelah
+perubahan DAG; XCom run lama belum memiliki field URL S3 untuk task pengiriman.
+
+Validasi lokal integrasi S3: run `s3_results_integration_20261026` berhasil pada
+ketiga task. Tiga objek (split Rintis, split PWC, POSTFLIN) ditemukan pada bucket
+`postingfile`; POSTFLIN berisi lima transaksi dan byte hasil kirim SFTP sama dengan
+objek S3. Pemeriksaan jalur upload gagal juga memastikan task menerima error.
+
+Input `local_path` juga diarsipkan melalui `S3ArtefactHook` menggunakan
+`input_s3_app = data_payment/acquiring/file`. File yang diambil dari FTP/SFTP
+(termasuk ZIP asli) diunggah ke
+`artefacts/data_payment/acquiring/file/<YYYYMMDD>/<run_id>/<nama_file>`.
+File hasil ekstraksi yang cocok dengan mask pemrosesan juga diarsipkan.
+XCom setiap file yang diproses menyertakan `source_s3_url`. Direktori `local_path`
+tetap menjadi staging ekstraksi/parsing. Backup sebelum perubahan input:
+`backups/dag_postingfile.before_s3_input_20261026_232501.py.bak`.

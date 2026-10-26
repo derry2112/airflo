@@ -22,3 +22,7 @@ Pemeriksaan sintaks dengan `ast.parse` berhasil. Belum ada eksekusi upload, stre
 - Parser CSV melakukan pemotongan berdasarkan baris fisik; bukan implementasi tambahan untuk record CSV yang berisi newline di dalam kutip.
 - `count_rows_s3` melewati header hanya jika URL berakhiran `.csv`.
 - Docstring dan nama parameter yang tidak konsisten dipertahankan. Tidak ada perbaikan logika dalam tugas transkripsi ini.
+
+## Integrasi setelah transkripsi
+
+Adapter `dags/utils/hooks/S3HookOcbc.py` sudah ditambahkan secara terpisah untuk memenuhi dependensi yang sebelumnya belum tersedia. Adapter menggunakan provider AWS Airflow. `dag_postingfile.py` sekarang mengunggah hasil lewat `put_file_to_s3` dan menggunakan S3 sebagai sumber pada task pengiriman. File `s3_artefact.py` tetap sama dengan hasil transkripsi. Catatan dependensi dan belum diuji di atas menggambarkan keadaan saat transkripsi awal.

@@ -9,6 +9,10 @@ from dags.utils.ftp import FTPHookOcbc
 from dags.utils.sftp import SftpHook, SFTPHookOcbc
 from dags.utils.postgres import PostgresEtlHook as PostgrestEtlHook
 from dags.utils.oracle import OracleEtlHook
+from dags.utils.s3_artefact import S3ArtefactHook
+from dags.utils.hooks.S3HookOcbc import S3HookOcbc
+from tempfile import TemporaryDirectory
+from urllib.parse import urlsplit
 from dags.utils.callback import Callback
 from dags.utils.models.model_postingfile import ReconHeader, ReconRecordData
 from dags.utils.models.airflow_constant import RecordEstimate, StorageEstimate, TimeEstimate
@@ -49,6 +53,10 @@ class ProcessDataMap(NamedTuple):
     mti_local_filepath: str
     pwc_local_filepath: str
     posting_local_filepaths: List[str]
+    mti_s3_url: str
+    pwc_s3_url: str
+    posting_s3_urls: List[str]
+    source_s3_url: str
 
 
 logger = logging.getLogger(__name__)
@@ -110,8 +118,13 @@ config = {'posting_settings': {'space': ' ',
  'format_date': '%Y%m%d',
  'result_local_path': '/data/airflow/nfs/artifacts/data_payment/acquiring/result/rintis/',
  'result_local_path_PWC': '/data/airflow/nfs/artifacts/data_payment/acquiring/result/rintisPWC',
+ # Local paths above are staging for the existing split/file generator.
+ 'result_s3_app_rintis': 'data_payment/acquiring/result/rintis',
+ 'result_s3_app_pwc': 'data_payment/acquiring/result/rintisPWC',
  'fetch_date': 0,
  'local_path': '/data/airflow/nfs/artifacts/data_payment/acquiring/file/',
+ # Local input is staging for ZIP extraction and parsing.
+ 'input_s3_app': 'data_payment/acquiring/file',
  'file_name_mask': 'QR_RECON_*.dsj_ISS',
  'file_name_mask_outgoing': '',
  'custom_function': 'split_rintis_qr_recon',
@@ -190,11 +203,16 @@ def dag_postingfile():
         date_folder = date.strftime('%y/%m/%d')
         local_path = os.path.join(config['local_path'], date_folder)
         os.makedirs(local_path, exist_ok=True)
+        source_s3_urls = {}
         source = _hook(config['source_connection_type'], config['source_connection'])
         try:
             for filename in files:
                 remote_path = os.path.join(config['source_path'], filename).replace('\\', '/')
-                source.retrieve_file(remote_path, os.path.join(local_path, filename))
+                input_file = os.path.join(local_path, filename)
+                source.retrieve_file(remote_path, input_file)
+                source_s3_urls[filename] = _upload_result_to_s3(
+                    input_file, config['input_s3_app'], date,
+                )
         finally:
             source.close_conn()
         for archive in glob.glob(os.path.join(local_path, '*.zip')):
@@ -212,6 +230,11 @@ def dag_postingfile():
         out_process_datamap = []
         for filename in filenames:
             source_file = os.path.join(local_path, filename)
+            # Archive matching extracted files too, while retaining the original ZIP.
+            if filename not in source_s3_urls:
+                source_s3_urls[filename] = _upload_result_to_s3(
+                    source_file, config['input_s3_app'], date,
+                )
             mti_file = os.path.join(mti_path, filename)
             pwc_file = os.path.join(pwc_path, filename)
             shutil.copy(source_file, mti_file)
@@ -219,7 +242,16 @@ def dag_postingfile():
             way4_records = _get_way4_data_new(period=date.strftime('%Y%m%d'), save_result_file=False)
             posting_records = _map_way4_to_posting_records_new(way4_records)
             posting_files = _split_rintis_qr_recon(str_file_name=source_file, str_result_name=mti_file, str_result_pwc=pwc_file, way4_posting_records=posting_records)
-            out_process_datamap.append(ProcessDataMap(filename, mti_file, pwc_file, posting_files)._asdict())
+            mti_s3_url = _upload_result_to_s3(mti_file, config['result_s3_app_rintis'], date)
+            pwc_s3_url = _upload_result_to_s3(pwc_file, config['result_s3_app_pwc'], date)
+            posting_s3_urls = [
+                _upload_result_to_s3(filepath, config['result_s3_app_pwc'], date)
+                for filepath in posting_files
+            ]
+            out_process_datamap.append(ProcessDataMap(
+                filename, mti_file, pwc_file, posting_files,
+                mti_s3_url, pwc_s3_url, posting_s3_urls, source_s3_urls[filename],
+            )._asdict())
         for raw_file in glob.glob(os.path.join(config['result_local_path_PWC'], 'QR_RECON*')):
             os.remove(raw_file)
         return out_process_datamap
@@ -233,21 +265,53 @@ def dag_postingfile():
         try:
             pwc = SFTPHookOcbc(ssh_conn_id=config['destination_connection_PWC_POST'])
             try:
-                for result in processed_files:
-                    remote_mti = os.path.join(config['destination_path'], result['filename']).replace('\\', '/')
-                    mti.store_file(remote_mti, result['mti_local_filepath'])
-                    for filepath in result['posting_local_filepaths']:
-                        remote_pwc = os.path.join(config['target_path'], os.path.basename(filepath)).replace('\\', '/')
-                        pwc.store_file(remote_pwc, filepath)
-                    marker = result['mti_local_filepath'] + '.chk'
-                    with open(marker, 'w', encoding='utf-8'):
-                        pass
-                    mti.store_file(remote_mti + '.chk', marker)
-                    logger.info('Posting terkirim: %s', result['filename'])
+                with TemporaryDirectory(prefix='postingfile-send-') as staging:
+                    for result in processed_files:
+                        mti_file = _download_result_from_s3(result['mti_s3_url'], staging)
+                        remote_mti = os.path.join(config['destination_path'], result['filename']).replace('\\', '/')
+                        mti.store_file(remote_mti, mti_file)
+                        for s3_url in result['posting_s3_urls']:
+                            filepath = _download_result_from_s3(s3_url, staging)
+                            remote_pwc = os.path.join(config['target_path'], os.path.basename(filepath)).replace('\\', '/')
+                            pwc.store_file(remote_pwc, filepath)
+                        marker = mti_file + '.chk'
+                        with open(marker, 'w', encoding='utf-8'):
+                            pass
+                        mti.store_file(remote_mti + '.chk', marker)
+                        logger.info('Posting terkirim dari S3: %s', result['filename'])
             finally:
                 pwc.close_conn()
         finally:
             mti.close_conn()
+
+    def _upload_result_to_s3(filepath, app_name, date):
+        # put_file_to_s3 catches upload exceptions, so verify its returned URL.
+        run_id = get_current_context()['dag_run'].run_id
+        s3_url = S3ArtefactHook().put_file_to_s3(
+            workflow_name=f'{run_id}/{os.path.basename(filepath)}',
+            app_name=app_name,
+            file_path=filepath,
+            ext=None,
+            date_file=date.strftime('%Y%m%d'),
+            is_delete_immediately=False,
+        )
+        if not s3_url or not s3_url.startswith('s3://'):
+            raise RuntimeError(f'Upload hasil ke S3 gagal: {filepath}')
+        logger.info('Hasil tersimpan di S3: %s', s3_url)
+        return s3_url
+
+    def _download_result_from_s3(s3_url, directory):
+        parsed = urlsplit(s3_url)
+        key = parsed.path.lstrip('/')
+        if parsed.scheme != 's3' or not parsed.netloc or not key:
+            raise ValueError(f'URL hasil S3 tidak valid: {s3_url}')
+        filename = os.path.basename(key)
+        if filename in ('', '.', '..'):
+            raise ValueError(f'Nama file hasil S3 tidak valid: {s3_url}')
+        local_file = os.path.join(directory, filename)
+        client = S3HookOcbc(aws_conn_id='s3-artefact').get_conn()
+        client.download_file(parsed.netloc, key, local_file)
+        return local_file
 
     def _processing_date(context):
         date = context.get('logical_date')
