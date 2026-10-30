@@ -18,3 +18,8 @@ __pycache__/
 
 
 .env
+
+# Data contoh settlement lokal; jangan ikut commit/push.
+/data/ACQ_MTI/ClearingRintisQRIS/261031NPG_RPT.zip
+/data/ACQ_MTI/ClearingRintisQRIS/251030D4_NPG.txt
+/data/ACQ_MTI/ClearingRintisQRIS/261031D4_NPG.txt

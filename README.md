@@ -1,3 +1,5 @@
+docker compose exec postgres psql -U airflow -d db_rekon_uat
+
 # Airflow QR Recon — panduan lingkungan lokal
 
 Panduan ini mengikuti `compose.yaml` utama: Airflow **3.1.7 / Python 3.12**,
@@ -691,3 +693,117 @@ RRN, menjaga urutan dan jumlah transaksi; duplikat enrichment memakai hasil pert
 Enrichment yang tidak lengkap menghasilkan error dengan daftar RRN terkait.
 Generator fixed-width menerima record bernama, bukan pasangan tuple record/MID.
 Backup sebelum perubahan memiliki suffix `before_dataframe_20261027_071056.bak`.
+
+### Settlement off-us: proses ZIP, unzip, dan penanganan kegagalan
+
+Implementasi berada dalam
+[`dag_settlement_off_us.py`](dags/payment-and-collection-platform/acquiring/dag_settlement_off_us.py).
+DAG menerima ZIP dari pengirim; DAG tidak membuat ZIP sumber. Pengamanan dan
+penanganan error dilakukan di DAG tanpa mengubah file `utils`.
+
+#### Alur pengolahan
+
+1. `get_unprocessed_files` membaca direktori
+   `/mtiuat/toocbc/QRRecon/ClearingRintisQRIS/` melalui connection `SFTP_EBSP`.
+   Nama ZIP harus sesuai tanggal hari ini saat task berjalan dalam zona waktu
+   WIB, dengan format **YYMMDD**. Contoh: 31 Oktober 2026 menggunakan
+   `261031NPG_RPT.zip`. Tanggal ini bukan logical date dari run historis.
+2. `download_zip_files` mengunduh ZIP ke direktori sementara, memvalidasinya,
+   lalu mengarsipkan ZIP asli ke S3 melalui connection `s3-artefact`.
+3. `extract_d4_files` mengunduh ulang ZIP dari S3 dan mengambil hanya member
+   dengan nama `*D4_NPG.txt`, tanpa membedakan huruf besar/kecil. Nama TXT
+   tidak wajib mengikuti tanggal ZIP; contoh `251030D4_NPG.txt` tetap cocok.
+   Member disimpan menggunakan basename, sehingga path di dalam ZIP tidak
+   digunakan sebagai direktori tujuan. Basename D4 yang duplikat ditolak.
+4. `load_d4_files` memeriksa kembali TXT dari S3, lalu membaca seluruh isinya
+   dengan encoding `utf-8-sig` secara strict. Parser menggabungkan dua baris
+   setiap transaksi dan menolak transaksi yang tidak lengkap, format transaksi
+   tidak valid, atau karakter NUL. Encoding dapat diubah melalui `txt_encoding`
+   jika format dari pengirim sudah dikonfirmasi; karakter tidak diabaikan.
+5. Data disimpan ke PostgreSQL connection `db_rekon_uat`: log file pada
+   `sw_rekon.acqpwc_file_log_tt`, summary per bank ACQUIRER dan periode pada
+   `sw_rekon.acqpwc_d4summary_tt`, serta detail pada
+   `sw_rekon.acqpwc_d4detail_tt`. Summary dihitung dari transaksi yang berhasil
+   diparse, menggunakan `Decimal` untuk nominal.
+
+#### Pemeriksaan integritas file
+
+| Tahap | Pemeriksaan | Tujuan |
+| --- | --- | --- |
+| Download SFTP | Ukuran dan modification time sumber dibandingkan sebelum/sesudah download; ukuran lokal harus sama | Mendeteksi perubahan sumber saat transfer atau download tidak lengkap. Pada fallback FTP, pemeriksaan sumber menggunakan ukuran. |
+| Membaca ZIP | Struktur ZIP dan CRC seluruh member diperiksa | Menolak ZIP terpotong, rusak, atau member yang gagal dibaca. |
+| Unzip D4 | Member dibaca sampai akhir untuk validasi CRC; ukuran TXT harus sama dengan ukuran pada metadata ZIP | Mendeteksi ekstraksi yang tidak lengkap; member D4 kosong ditolak. |
+| Upload S3 | Objek dibaca kembali dan dibandingkan ukuran serta SHA-256 dengan file lokal | Memastikan isi yang tersimpan sama dengan file yang diunggah. |
+| Download S3 | Ukuran serta SHA-256 dibandingkan dengan nilai yang diteruskan melalui XCom | Mendeteksi perubahan isi antar-task, termasuk perubahan byte dengan ukuran file yang tetap sama. |
+
+SHA-256 menjadi pembanding isi setelah download sumber; checksum ini bukan
+checksum independen dari pengirim. ZIP yang valid tetapi sudah kehilangan
+transaksi lengkap sebelum dikompresi belum tentu terdeteksi. Kasus tersebut
+memerlukan checksum, jumlah transaksi, atau trailer pembanding tepercaya dari
+pengirim. Footer SALES yang tersedia kini divalidasi; bagian tanpa footer
+dicatat sebagai belum terkonfirmasi kelengkapannya.
+Pembacaan ulang S3 menambah I/O dan waktu proses, sedangkan TXT menggunakan disk
+sementara sebelum diparse.
+
+#### Retry, karantina, dan konsistensi database
+
+- Setiap operasi download SFTP/FTP dan upload/download S3 dicoba maksimal
+  **3 kali** untuk gangguan sementara, dengan exponential backoff
+  **2 lalu 4 detik**. Error format/checksum/rekonsiliasi langsung ditolak. Konfigurasinya adalah
+  `transfer_attempts` dan `transfer_retry_delay_seconds`. Koneksi sumber dibuka
+  ulang setiap percobaan. Retry ini tidak diterapkan pada insert database.
+- Jika file tetap gagal, bytes lokal yang tersedia dan `reason.json` disimpan
+  ke S3 dengan pola key
+  `artefacts/settlement_off-us/quarantine/<stage>/<unique-id>/<YYYYMMDD>/<run_id>/`.
+  Manifest mencatat nama file, tahap kegagalan, tipe error, penyebab, nomor baris
+  bila tersedia dari parser, waktu, serta lokasi sumber. Jika bytes lokal tidak
+  tersedia, lokasi sumber S3/SFTP tetap dicantumkan untuk penelusuran.
+- File berstatus `quarantined` dilewati oleh tahap selanjutnya. File independen
+  yang valid tetap diproses. Kegagalan CRC tingkat ZIP menolak seluruh arsip;
+  kegagalan pembacaan sebuah TXT tidak menghentikan pemrosesan TXT valid lainnya.
+- Jika penyimpanan karantina sendiri gagal, status menjadi `quarantine_failed`;
+  sistem tidak mengklaim file berhasil dikarantina. Periksa log dan XCom untuk
+  menelusuri sumber dan tahap kegagalannya.
+- Log, summary, dan detail menggunakan **satu transaksi database per file D4**.
+  Kegagalan insert menyebabkan rollback seluruh perubahan file tersebut.
+  Advisory transaction lock dan pemeriksaan nama file pada log mencegah insert
+  ulang oleh flow ini. Writer lain harus mengikuti mekanisme lock yang sama.
+- `show_result` dijalankan setelah file valid selesai diproses. Jika ada file
+  ditolak, task terakhir ini membuat DAG berstatus gagal agar operator melihat
+  masalahnya. Status gagal tidak membatalkan file valid yang sudah commit.
+
+#### Pemeriksaan dan pemrosesan ulang oleh operator
+
+1. Buka log task di Airflow dan cari `FILE RESULT` atau `FILE REJECTED`.
+   Gunakan URL `quarantine_manifest_s3_url` untuk membuka `reason.json` di S3.
+2. Untuk gangguan transfer, periksa koneksi dan ketersediaan sumber. Untuk
+   encoding berbeda, konfirmasikan encoding dengan pengirim. Untuk transaksi
+   terpotong, minta file lengkap; jangan mengisi data transaksi yang hilang
+   dengan perkiraan.
+3. Perbaiki/ganti file sumber dan jalankan ulang DAG. Filter tanggal tetap
+   menggunakan hari saat task berjalan. File yang gagal belum memiliki log
+   sukses sehingga dapat dicoba lagi. File valid yang sudah tersimpan akan
+   berstatus `already_processed`, tanpa insert duplikat. Koreksi terhadap file
+   yang sudah sukses memerlukan prosedur reprocessing tersendiri.
+
+Pengujian mencakup ZIP terpotong, CRC rusak, perubahan isi dengan ukuran sama,
+encoding tidak terbaca, transaksi terpotong, retry, serta campuran TXT valid dan
+bermasalah. Jalankan:
+
+```bash
+python3 -m unittest discover -s tests -p 'test_settlement_d4.py' -v
+```
+
+File contoh lokal `261031NPG_RPT.zip` dan `251030D4_NPG.txt` dikecualikan dari
+Git melalui `.gitignore`; file tersebut tetap tersedia untuk pengujian lokal.
+
+
+### Kontrol ingestion settlement untuk input ZIP saja
+
+Input tetap berupa ZIP tanpa kewajiban manifest atau `.done` dari pengirim.
+Pemeriksaan kesiapan sumber, rekonsiliasi footer, audit permanen, constraint
+database, dan koreksi dengan versi/persetujuan tersedia pada
+[catatan operasional](docs/settlement_ingestion_operasional.md).
+Jalankan migrasi tambahan `dags/sql/settlement_ingestion_controls.sql` sebelum
+menjalankan versi DAG ini. Data lama tanpa checksum memerlukan review baseline;
+kode tidak mengisi checksum atau menghapus riwayat secara otomatis.
