@@ -712,7 +712,8 @@ penanganan error dilakukan di DAG tanpa mengubah file `utils`.
    lalu mengarsipkan ZIP asli ke S3 melalui connection `s3-artefact`.
 3. `extract_d4_files` mengunduh ulang ZIP dari S3 dan mengambil hanya member
    dengan nama `*D4_NPG.txt`, tanpa membedakan huruf besar/kecil. Nama TXT
-   tidak wajib mengikuti tanggal ZIP; contoh `251030D4_NPG.txt` tetap cocok.
+   harus diawali tanggal hari ini dalam format YYMMDD (WIB); contoh
+   `261031D4_NPG.txt` untuk 31 Oktober 2026. TXT tanggal lain dilewati.
    Member disimpan menggunakan basename, sehingga path di dalam ZIP tidak
    digunakan sebagai direktori tujuan. Basename D4 yang duplikat ditolak.
 4. `load_d4_files` memeriksa kembali TXT dari S3, lalu membaca seluruh isinya

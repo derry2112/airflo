@@ -26,361 +26,6 @@ from dags.utils.models.airflow_constant import Owner
 _project_root = str(Path(__file__).resolve().parents[3])
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
-
-def is_transient_transfer_error(error):
-    """Retry transport/service availability failures, not invalid business input."""
-    if isinstance(error, (FileNotFoundError, PermissionError, ValueError, zipfile.BadZipFile)):
-        return False
-    response = getattr(error, 'response', None)
-    if isinstance(response, dict):
-        status = response.get('ResponseMetadata', {}).get('HTTPStatusCode', 0)
-        code = response.get('Error', {}).get('Code', '')
-        return status in (408, 429) or status >= 500 or code in (
-            'SlowDown', 'RequestTimeout', 'Throttling', 'ServiceUnavailable')
-    if isinstance(error, OSError):
-        return True
-    return type(error).__name__ in (
-        'EndpointConnectionError', 'ConnectionClosedError', 'ReadTimeoutError',
-        'ConnectTimeoutError', 'SSHException', 'NoValidConnectionsError')
-
-
-def source_is_stable(before, after, now, minimum_age_seconds):
-    return (before == after and before[0] > 0 and
-            (after[1] is None or now - after[1] >= minimum_age_seconds))
-
-
-def select_ready_archives(names, expected, require_sidecars=False):
-    available = set(names)
-    candidates = sorted(name for name in available
-                        if fnmatch.fnmatchcase(name.upper(), expected.upper()))
-    ready, waiting = [], []
-    for name in candidates:
-        (ready if not require_sidecars or (name + '.done' in available and name + '.manifest.json' in available)
-         else waiting).append(name)
-    return ready, waiting
-
-
-def validate_sender_manifest(manifest, archive_name, file_mask='*D4_NPG.txt'):
-    """Versioned sender contract; all totals are decimal strings, never floats."""
-    def require(condition, message):
-        if not condition:
-            raise ValueError('Manifest: ' + message)
-
-    def fingerprint(entry):
-        require(type(entry.get('size')) is int and entry['size'] > 0, 'invalid size')
-        require(isinstance(entry.get('sha256'), str) and
-                re.fullmatch(r'[0-9a-f]{64}', entry['sha256']), 'invalid SHA-256')
-
-    def total(entry):
-        require(type(entry.get('transaction_count')) is int and
-                entry['transaction_count'] >= 0, 'invalid transaction count')
-        require(isinstance(entry.get('total_amount'), str) and
-                re.fullmatch(r'\d{1,17}\.\d{2}', entry['total_amount']), 'invalid total amount')
-
-    require(isinstance(manifest, dict) and type(manifest.get('schema_version')) is int
-            and manifest['schema_version'] == 1,
-            'unsupported schema version')
-    archive = manifest.get('archive')
-    require(isinstance(archive, dict) and archive.get('filename') == archive_name,
-            'archive filename mismatch')
-    fingerprint(archive)
-    files = manifest.get('files')
-    require(isinstance(files, list) and len(files) > 0, 'missing D4 files')
-    names = set()
-    for entry in files:
-        require(isinstance(entry, dict), 'invalid file entry')
-        name = entry.get('filename')
-        require(isinstance(name, str) and name not in ('', '.', '..') and
-                '/' not in name and '\\' not in name and
-                fnmatch.fnmatchcase(name.upper(), file_mask.upper()), 'invalid D4 filename')
-        require(name.upper() not in names, 'duplicate D4 filename')
-        names.add(name.upper())
-        fingerprint(entry)
-        total(entry)
-        banks = entry.get('banks')
-        require(isinstance(banks, list) and len(banks) > 0, 'missing bank totals')
-        keys = set()
-        for bank in banks:
-            require(isinstance(bank, dict) and isinstance(bank.get('acquirer'), str)
-                    and bank['acquirer'].strip(), 'invalid bank')
-            require(isinstance(bank.get('period'), str), 'invalid period')
-            datetime.strptime(bank['period'], '%Y-%m-%d')
-            key = (bank['acquirer'], bank['period'])
-            require(key not in keys, 'duplicate bank/period')
-            keys.add(key)
-            total(bank)
-        require(sum(bank['transaction_count'] for bank in banks) == entry['transaction_count'],
-                'bank counts do not match file count')
-        require(sum((Decimal(bank['total_amount']) for bank in banks), Decimal('0')) ==
-                Decimal(entry['total_amount']), 'bank amounts do not match file amount')
-    return manifest
-
-
-def reconcile_report(report, expected):
-    actual = {(group['issuer'], group['period'].isoformat()):
-              (group['frekuensi'], group['totalamount']) for group in report['groups']}
-    declared = {(bank['acquirer'], bank['period']):
-                (bank['transaction_count'], Decimal(bank['total_amount']))
-                for bank in expected['banks']}
-    if actual != declared:
-        raise ValueError('Reconciliation failed: bank/period counts or amounts differ from sender manifest')
-    if (sum(group['frekuensi'] for group in report['groups']) != expected['transaction_count']
-            or sum((group['totalamount'] for group in report['groups']), Decimal('0'))
-            != Decimal(expected['total_amount'])):
-        raise ValueError('Reconciliation failed: file count or amount differs from sender manifest')
-
-
-def write_ingestion_audit(cursor, item, run_id, status, stage, details=None, fileid=None):
-    integrity = item.get('d4_integrity') or item.get('zip_integrity') or {}
-    cursor.execute(
-        'INSERT INTO sw_rekon.acqpwc_ingestion_audit_tt '
-        '(runid, filename, zipfilename, contentsha256, status, stage, details, fileid) '
-        'VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s)',
-        (run_id, item['filename'], item.get('zipfilename'), integrity.get('sha256'),
-         status, stage, json.dumps(details or {}), fileid))
-
-
-def retry_transfer(operation, label, attempts=3, delay_seconds=2):
-    if attempts < 1 or delay_seconds < 0:
-        raise ValueError('Invalid transfer retry configuration')
-    for attempt in range(1, attempts + 1):
-        try:
-            return operation()
-        except Exception as error:
-            logging.warning('TRANSFER FAILED: %s attempt=%s/%s error_type=%s',
-                            label, attempt, attempts, type(error).__name__)
-            if attempt == attempts or not is_transient_transfer_error(error):
-                raise
-            time.sleep(min(delay_seconds * (2 ** (attempt - 1)), 30))
-
-
-def process_isolated(items, operation, on_failure):
-    results = []
-    for item in items:
-        if item.get('status') in ('quarantined', 'quarantine_failed'):
-            results.append(item)
-            continue
-        try:
-            results.extend(operation(item))
-        except Exception as error:
-            results.append(on_failure(item, error))
-    return results
-
-
-def fingerprint_stream(stream):
-    digest = hashlib.sha256()
-    size = 0
-    for chunk in iter(lambda: stream.read(1024 * 1024), b''):
-        size += len(chunk)
-        digest.update(chunk)
-    return {'size': size, 'sha256': digest.hexdigest()}
-
-
-def fingerprint_file(path):
-    with open(path, 'rb') as stream:
-        return fingerprint_stream(stream)
-
-
-def verify_fingerprint(actual, expected, label):
-    if actual != expected:
-        raise ValueError(f'Integrity check failed for {label}: size/SHA-256 mismatch')
-
-
-def validate_zip(path):
-    if not zipfile.is_zipfile(path):
-        raise ValueError(f'Invalid or truncated ZIP: {os.path.basename(path)}')
-    with zipfile.ZipFile(path) as archive:
-        bad_member = archive.testzip()
-        if bad_member:
-            raise ValueError(f'ZIP CRC check failed: {bad_member}')
-
-
-def extract_verified_member(archive, member, destination):
-    if member.is_dir() or member.file_size == 0:
-        raise ValueError(f'Empty D4 member: {member.filename}')
-    try:
-        with archive.open(member) as source, open(destination, 'wb') as target:
-            shutil.copyfileobj(source, target)
-        actual = fingerprint_file(destination)
-        if actual['size'] != member.file_size:
-            raise ValueError(f'Extracted size mismatch: {member.filename}')
-        return actual
-    except Exception:
-        Path(destination).unlink(missing_ok=True)
-        raise
-
-
-DETAIL_FIELDS = (
-    'transactiondate', 'transactiontime', 'transactioncode', 'transactiontype',
-    'cardno', 'transactionamount', 'interchangefee', 'authcode', 'traceno',
-    'refno', 'termid', 'merchantid', 'merchantname',
-)
-_FIRST = re.compile(
-    r'^\s*\d+\s+(\d{2}/\d{2}/\d{2})\s+(\d{2}:\d{2}:\d{2})\s+'
-    r'(\d+)\s+(\d+)\s+(\d+)\s+([\d,]+\.\d{2})\s+'
-    r'([\d,]+\.\d{2})\s+(\S+)\s+(\S+)\s*$'
-)
-_SECOND = re.compile(r'^\s*(\d+)\s+(\S+)\s+(\d+-\d+)\s+(.+?)\s*$')
-
-
-def parse_d4(lines):
-    groups = {}
-    footer_positions = {}
-    footer_checks = {}
-    bank = period = pending = issuer = None
-    current = None
-    for lineno, line in enumerate(lines, 1):
-        if '\x00' in line:
-            raise ValueError(f'D4 line {lineno}: unexpected NUL byte')
-        line = line.rstrip('\r\n\f')
-        if pending is not None:
-            match = _SECOND.match(line)
-            if not match:
-                raise ValueError(f'D4 line {lineno}: missing continuation for transaction at line {pending[0]}')
-            pending[1].update(zip(DETAIL_FIELDS[9:], match.groups()))
-            current['details'].append(pending[1])
-            pending = None
-            continue
-        match = re.search(r'ACQUIRER:\s*(.+?)(?:\s{2,}TANGGAL\s*:|$)', line)
-        if match:
-            bank = match.group(1).strip()
-            period = None
-            current = None
-        match = re.search(r'TANGGAL\s*:\s*(\d{2}-\d{2}-\d{2})', line)
-        if match:
-            period = datetime.strptime(match.group(1), '%d-%m-%y').date()
-        match = re.search(r'ISSUER\s*:\s*(.+?)\s*$', line)
-        if match:
-            issuer = match.group(1).strip()
-        if bank and period:
-            key = (bank, period)
-            numeric_code = re.match(r'^[A-Z]+-(\d+)\b', bank)
-            current = groups.setdefault(key, {
-                'issuer': bank, 'institutionid': int(numeric_code.group(1)) if numeric_code else None,
-                'period': period, 'details': [],
-            })
-        if re.match(r'^0\s+SALES\b', line):
-            footer = re.fullmatch(r'0\s+SALES\s+(\d+)\s+([\d,]+\.\d{2})\s*', line)
-            if current is None or footer is None:
-                raise ValueError(f'D4 line {lineno}: invalid SALES footer')
-            key = (bank, period)
-            section = current['details'][footer_positions.get(key, 0):]
-            if (len(section) != int(footer.group(1)) or
-                    sum((row['transactionamount'] for row in section), Decimal('0'))
-                    != Decimal(footer.group(2).replace(',', ''))):
-                raise ValueError(f'D4 line {lineno}: SALES footer count/amount mismatch')
-            footer_positions[key] = len(current['details'])
-            footer_checks[key] = footer_checks.get(key, 0) + 1
-            continue
-        match = _FIRST.match(line)
-        if match:
-            if current is None:
-                raise ValueError(f'D4 line {lineno}: transaction without bank/period')
-            date, time, code, kind, card, amount, fee, auth, trace = match.groups()
-            detail = dict(zip(DETAIL_FIELDS[:9], (
-                datetime.strptime(date, '%d/%m/%y').date(),
-                datetime.strptime(time, '%H:%M:%S').time(), code, kind, card,
-                Decimal(amount.replace(',', '')), Decimal(fee.replace(',', '')), auth, trace,
-            )))
-            pending = (lineno, detail)
-        elif re.match(r'^\s*\d+\s+\d{2}/\d{2}/\d{2}\b', line):
-            raise ValueError(f'D4 line {lineno}: malformed transaction')
-    if pending is not None:
-        raise ValueError(f'D4 line {pending[0]}: incomplete transaction at end of file')
-    if not groups:
-        raise ValueError('D4 report contains no bank/period sections')
-    for group in groups.values():
-        group['frekuensi'] = len(group['details'])
-        group['totalamount'] = sum((row['transactionamount'] for row in group['details']), Decimal('0.00'))
-    missing = [{'acquirer': key[0], 'period': key[1].isoformat()}
-               for key, group in groups.items()
-               if key not in footer_checks or footer_positions[key] != len(group['details'])]
-    return {'issuername': issuer, 'groups': list(groups.values()),
-            'controls': {'validated_footers': sum(footer_checks.values()),
-                         'banks_without_complete_footer': missing}}
-
-
-
-def persist_d4(connection, item, report, run_id):
-    try:
-        if item.get('expected') is not None:
-            reconcile_report(report, item['expected'])
-        checksum = item['d4_integrity']['sha256']
-        if not re.fullmatch(r'[0-9a-f]{64}', checksum):
-            raise ValueError('Missing verified D4 checksum')
-        with connection.cursor() as cursor:
-            cursor.execute('SELECT pg_advisory_xact_lock(hashtext(%s))', (item['filename'].lower(),))
-            cursor.execute(
-                'SELECT fileid, contentsha256, fileversion FROM sw_rekon.acqpwc_file_log_tt '
-                "WHERE lower(filename) = lower(%s) AND transactiontype = 'D4' AND isactive FOR UPDATE",
-                (item['filename'],))
-            existing = cursor.fetchone()
-            requestid = previous_id = None
-            version = 1
-            if existing:
-                previous_id, previous_checksum, version = existing
-                if previous_checksum == checksum:
-                    write_ingestion_audit(cursor, item, run_id, 'ALREADY_PROCESSED',
-                                          'database', fileid=previous_id)
-                    connection.commit()
-                    return {'filename': item['filename'], 'fileid': previous_id,
-                            'status': 'already_processed', 'version': version}
-                if previous_checksum is None:
-                    raise ValueError('Existing file has no verified checksum; operator review required')
-                cursor.execute(
-                    'SELECT requestid FROM sw_rekon.acqpwc_reprocess_request_tt '
-                    "WHERE lower(filename)=lower(%s) AND previoussha256=%s AND expectedsha256=%s "
-                    "AND status='APPROVED' FOR UPDATE",
-                    (item['filename'], previous_checksum, checksum))
-                approval = cursor.fetchone()
-                if not approval:
-                    raise ValueError('Changed content for existing filename requires an approved reprocess request')
-                requestid = approval[0]
-                cursor.execute('UPDATE sw_rekon.acqpwc_file_log_tt SET isactive=FALSE WHERE fileid=%s',
-                               (previous_id,))
-                version += 1
-            filedate = re.match(r'(\d{6})', item['filename'])
-            if not filedate:
-                raise ValueError('D4 filename must start with a six-digit file date')
-            cursor.execute(
-                'INSERT INTO sw_rekon.acqpwc_file_log_tt '
-                '(filepath, filename, transactiontype, insetby, issuername, filedate, '
-                'contentsha256, fileversion, replacesfileid) '
-                'VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING fileid',
-                (item.get('source_path', ''), item['filename'], 'D4', 'dag_settlement_off-us',
-                 report['issuername'], filedate.group(1), checksum, version, previous_id))
-            fileid = cursor.fetchone()[0]
-            for group in report['groups']:
-                cursor.execute(
-                    'INSERT INTO sw_rekon.acqpwc_d4summary_tt '
-                    '(fileid, institutionid, issuer, period, frekuensi, totalamount) '
-                    'VALUES (%s, %s, %s, %s, %s, %s) RETURNING summaryid',
-                    (fileid, group['institutionid'], group['issuer'], group['period'],
-                     group['frekuensi'], group['totalamount']))
-                summaryid = cursor.fetchone()[0]
-                if group['details']:
-                    cursor.executemany(
-                        'INSERT INTO sw_rekon.acqpwc_d4detail_tt (summaryid, '
-                        + ', '.join(DETAIL_FIELDS) + ') VALUES ('
-                        + ', '.join(['%s'] * (len(DETAIL_FIELDS) + 1)) + ')',
-                        [(summaryid, *(row[field] for field in DETAIL_FIELDS)) for row in group['details']])
-            if requestid is not None:
-                cursor.execute(
-                    "UPDATE sw_rekon.acqpwc_reprocess_request_tt SET status='APPLIED', "
-                    'appliedat=CURRENT_TIMESTAMP, oldfileid=%s, newfileid=%s WHERE requestid=%s',
-                    (previous_id, fileid, requestid))
-            write_ingestion_audit(cursor, item, run_id, 'LOADED', 'database',
-                                  {'version': version, 'reprocess_request_id': requestid,
-                                   'report_controls': report.get('controls')}, fileid)
-        connection.commit()
-        return {'filename': item['filename'], 'fileid': fileid, 'status': 'inserted',
-                'version': version, 'summaries': len(report['groups']),
-                'details': sum(group['frekuensi'] for group in report['groups'])}
-    except Exception:
-        connection.rollback()
-        raise
-
-
 class GenericSFTPHook:
     def __init__(self, ssh_conn_id):
         self.hook = SFTPHookOcbc(ssh_conn_id=ssh_conn_id)
@@ -413,7 +58,17 @@ class GenericSFTPHook:
             self.conn = None
 
 db_rekon = PostgresEtlHook()
-
+DETAIL_FIELDS = (
+    'transactiondate', 'transactiontime', 'transactioncode', 'transactiontype',
+    'cardno', 'transactionamount', 'interchangefee', 'authcode', 'traceno',
+    'refno', 'termid', 'merchantid', 'merchantname',
+)
+_FIRST = re.compile(
+    r'^\s*\d+\s+(\d{2}/\d{2}/\d{2})\s+(\d{2}:\d{2}:\d{2})\s+'
+    r'(\d+)\s+(\d+)\s+(\d+)\s+([\d,]+\.\d{2})\s+'
+    r'([\d,]+\.\d{2})\s+(\S+)\s+(\S+)\s*$'
+)
+_SECOND = re.compile(r'^\s*(\d+)\s+(\S+)\s+(\d+-\d+)\s+(.+?)\s*$')
 config = {
     'workflow_name': 'dag_settlement_off-us',
     "owner": Owner.PAYMENT_AND_COLLECTION_PLATFORM,
@@ -436,7 +91,7 @@ config = {
     'source_path': '/mtiuat/toocbc/QRRecon/ClearingRintisQRIS/',
     'source_connection_type': 'SFTP',
 
-    'file_zip': '{date}NPG_RPT.zip',
+    'file_zip': '*NPG_RPT.zip',
     'file_txt': '*D4_NPG.txt',
 
     'input_s3_app': 'settlement_off-us',
@@ -470,7 +125,6 @@ default_args = {
     "execution_timeout": timedelta(minutes=10),
 }
 
-
 @dag(
     dag_id=workflow_name,
     schedule=user_cron,
@@ -483,6 +137,7 @@ default_args = {
     max_active_runs=1,
     on_success_callback=callback.dag_success_alert,
 )
+
 def dag_settlement_off_us():
 
     @task
@@ -496,10 +151,11 @@ def dag_settlement_off_us():
             logging.info("FILES FOUND: %s",files)
 
             file_date = datetime.now(tz).strftime("%y%m%d")
-            expected_file = config['file_zip'].replace('{date}', file_date)
-            logging.info("EXPECTED FILE : %s", expected_file)
+            file_mask = config['file_zip']
+            today_files = [name for name in files if name.startswith(file_date)]
+            logging.info('FILE DATE: %s; FILE MASK: %s', file_date, file_mask)
             candidates, waiting = select_ready_archives(
-                files, expected_file, config['require_sender_manifest'])
+                today_files, file_mask, config['require_sender_manifest'])
             snapshots = {}
             remote_conn = source.get_conn()
             for name in candidates:
@@ -526,6 +182,343 @@ def dag_settlement_off_us():
             return ready
         finally:
             source.close_conn()
+
+    def is_transient_transfer_error(error):
+        if isinstance(error, (FileNotFoundError, PermissionError, ValueError, zipfile.BadZipFile)):
+            return False
+        response = getattr(error, 'response', None)
+        if isinstance(response, dict):
+            status = response.get('ResponseMetadata', {}).get('HTTPStatusCode', 0)
+            code = response.get('Error', {}).get('Code', '')
+            return status in (408, 429) or status >= 500 or code in (
+                'SlowDown', 'RequestTimeout', 'Throttling', 'ServiceUnavailable')
+        if isinstance(error, OSError):
+            return True
+        return type(error).__name__ in (
+            'EndpointConnectionError', 'ConnectionClosedError', 'ReadTimeoutError',
+            'ConnectTimeoutError', 'SSHException', 'NoValidConnectionsError')
+
+
+    def source_is_stable(before, after, now, minimum_age_seconds):
+        return (before == after and before[0] > 0 and
+                (after[1] is None or now - after[1] >= minimum_age_seconds))
+
+
+    def select_ready_archives(names, expected, require_sidecars=False):
+        available = set(names)
+        candidates = sorted(name for name in available
+                            if fnmatch.fnmatchcase(name.upper(), expected.upper()))
+        ready, waiting = [], []
+        for name in candidates:
+            (ready if not require_sidecars or (name + '.done' in available and name + '.manifest.json' in available)
+            else waiting).append(name)
+        return ready, waiting
+
+
+    def validate_sender_manifest(manifest, archive_name, file_mask='*D4_NPG.txt'):
+        def require(condition, message):
+            if not condition:
+                raise ValueError('Manifest: ' + message)
+
+        def fingerprint(entry):
+            require(type(entry.get('size')) is int and entry['size'] > 0, 'invalid size')
+            require(isinstance(entry.get('sha256'), str) and
+                    re.fullmatch(r'[0-9a-f]{64}', entry['sha256']), 'invalid SHA-256')
+
+        def total(entry):
+            require(type(entry.get('transaction_count')) is int and
+                    entry['transaction_count'] >= 0, 'invalid transaction count')
+            require(isinstance(entry.get('total_amount'), str) and
+                    re.fullmatch(r'\d{1,17}\.\d{2}', entry['total_amount']), 'invalid total amount')
+
+        require(isinstance(manifest, dict) and type(manifest.get('schema_version')) is int
+                and manifest['schema_version'] == 1,
+                'unsupported schema version')
+        archive = manifest.get('archive')
+        require(isinstance(archive, dict) and archive.get('filename') == archive_name,
+                'archive filename mismatch')
+        fingerprint(archive)
+        files = manifest.get('files')
+        require(isinstance(files, list) and len(files) > 0, 'missing D4 files')
+        names = set()
+        for entry in files:
+            require(isinstance(entry, dict), 'invalid file entry')
+            name = entry.get('filename')
+            require(isinstance(name, str) and name not in ('', '.', '..') and
+                    '/' not in name and '\\' not in name and
+                    fnmatch.fnmatchcase(name.upper(), file_mask.upper()), 'invalid D4 filename')
+            require(name.upper() not in names, 'duplicate D4 filename')
+            names.add(name.upper())
+            fingerprint(entry)
+            total(entry)
+            banks = entry.get('banks')
+            require(isinstance(banks, list) and len(banks) > 0, 'missing bank totals')
+            keys = set()
+            for bank in banks:
+                require(isinstance(bank, dict) and isinstance(bank.get('acquirer'), str)
+                        and bank['acquirer'].strip(), 'invalid bank')
+                require(isinstance(bank.get('period'), str), 'invalid period')
+                datetime.strptime(bank['period'], '%Y-%m-%d')
+                key = (bank['acquirer'], bank['period'])
+                require(key not in keys, 'duplicate bank/period')
+                keys.add(key)
+                total(bank)
+            require(sum(bank['transaction_count'] for bank in banks) == entry['transaction_count'],
+                    'bank counts do not match file count')
+            require(sum((Decimal(bank['total_amount']) for bank in banks), Decimal('0')) ==
+                    Decimal(entry['total_amount']), 'bank amounts do not match file amount')
+        return manifest
+
+
+    def reconcile_report(report, expected):
+        actual = {(group['issuer'], group['period'].isoformat()):
+                (group['frekuensi'], group['totalamount']) for group in report['groups']}
+        declared = {(bank['acquirer'], bank['period']):
+                    (bank['transaction_count'], Decimal(bank['total_amount']))
+                    for bank in expected['banks']}
+        if actual != declared:
+            raise ValueError('Reconciliation failed: bank/period counts or amounts differ from sender manifest')
+        if (sum(group['frekuensi'] for group in report['groups']) != expected['transaction_count']
+                or sum((group['totalamount'] for group in report['groups']), Decimal('0'))
+                != Decimal(expected['total_amount'])):
+            raise ValueError('Reconciliation failed: file count or amount differs from sender manifest')
+
+
+    def write_ingestion_audit(cursor, item, run_id, status, stage, details=None, fileid=None):
+        integrity = item.get('d4_integrity') or item.get('zip_integrity') or {}
+        cursor.execute(
+            'INSERT INTO sw_rekon.acqpwc_ingestion_audit_tt '
+            '(runid, filename, zipfilename, contentsha256, status, stage, details, fileid) '
+            'VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s)',
+            (run_id, item['filename'], item.get('zipfilename'), integrity.get('sha256'),
+            status, stage, json.dumps(details or {}), fileid))
+
+
+    def retry_transfer(operation, label, attempts=3, delay_seconds=2):
+        if attempts < 1 or delay_seconds < 0:
+            raise ValueError('Invalid transfer retry configuration')
+        for attempt in range(1, attempts + 1):
+            try:
+                return operation()
+            except Exception as error:
+                logging.warning('TRANSFER FAILED: %s attempt=%s/%s error_type=%s',
+                                label, attempt, attempts, type(error).__name__)
+                if attempt == attempts or not is_transient_transfer_error(error):
+                    raise
+                time.sleep(min(delay_seconds * (2 ** (attempt - 1)), 30))
+
+
+    def process_isolated(items, operation, on_failure):
+        results = []
+        for item in items:
+            if item.get('status') in ('quarantined', 'quarantine_failed'):
+                results.append(item)
+                continue
+            try:
+                results.extend(operation(item))
+            except Exception as error:
+                results.append(on_failure(item, error))
+        return results
+
+
+    def fingerprint_stream(stream):
+        digest = hashlib.sha256()
+        size = 0
+        for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+            size += len(chunk)
+            digest.update(chunk)
+        return {'size': size, 'sha256': digest.hexdigest()}
+
+
+    def fingerprint_file(path):
+        with open(path, 'rb') as stream:
+            return fingerprint_stream(stream)
+
+
+    def verify_fingerprint(actual, expected, label):
+        if actual != expected:
+            raise ValueError(f'Integrity check failed for {label}: size/SHA-256 mismatch')
+
+
+    def validate_zip(path):
+        if not zipfile.is_zipfile(path):
+            raise ValueError(f'Invalid or truncated ZIP: {os.path.basename(path)}')
+        with zipfile.ZipFile(path) as archive:
+            bad_member = archive.testzip()
+            if bad_member:
+                raise ValueError(f'ZIP CRC check failed: {bad_member}')
+
+
+    def extract_verified_member(archive, member, destination):
+        if member.is_dir() or member.file_size == 0:
+            raise ValueError(f'Empty D4 member: {member.filename}')
+        try:
+            with archive.open(member) as source, open(destination, 'wb') as target:
+                shutil.copyfileobj(source, target)
+            actual = fingerprint_file(destination)
+            if actual['size'] != member.file_size:
+                raise ValueError(f'Extracted size mismatch: {member.filename}')
+            return actual
+        except Exception:
+            Path(destination).unlink(missing_ok=True)
+            raise
+
+
+    def parse_d4(lines):
+        groups = {}
+        footer_positions = {}
+        footer_checks = {}
+        bank = period = pending = issuer = None
+        current = None
+        for lineno, line in enumerate(lines, 1):
+            if '\x00' in line:
+                raise ValueError(f'D4 line {lineno}: unexpected NUL byte')
+            line = line.rstrip('\r\n\f')
+            if pending is not None:
+                match = _SECOND.match(line)
+                if not match:
+                    raise ValueError(f'D4 line {lineno}: missing continuation for transaction at line {pending[0]}')
+                pending[1].update(zip(DETAIL_FIELDS[9:], match.groups()))
+                current['details'].append(pending[1])
+                pending = None
+                continue
+            match = re.search(r'ACQUIRER:\s*(.+?)(?:\s{2,}TANGGAL\s*:|$)', line)
+            if match:
+                bank = match.group(1).strip()
+                period = None
+                current = None
+            match = re.search(r'TANGGAL\s*:\s*(\d{2}-\d{2}-\d{2})', line)
+            if match:
+                period = datetime.strptime(match.group(1), '%d-%m-%y').date()
+            match = re.search(r'ISSUER\s*:\s*(.+?)\s*$', line)
+            if match:
+                issuer = match.group(1).strip()
+            if bank and period:
+                key = (bank, period)
+                numeric_code = re.match(r'^[A-Z]+-(\d+)\b', bank)
+                current = groups.setdefault(key, {
+                    'issuer': bank, 'institutionid': int(numeric_code.group(1)) if numeric_code else None,
+                    'period': period, 'details': [],
+                })
+            if re.match(r'^0\s+SALES\b', line):
+                footer = re.fullmatch(r'0\s+SALES\s+(\d+)\s+([\d,]+\.\d{2})\s*', line)
+                if current is None or footer is None:
+                    raise ValueError(f'D4 line {lineno}: invalid SALES footer')
+                key = (bank, period)
+                section = current['details'][footer_positions.get(key, 0):]
+                if (len(section) != int(footer.group(1)) or
+                        sum((row['transactionamount'] for row in section), Decimal('0'))
+                        != Decimal(footer.group(2).replace(',', ''))):
+                    raise ValueError(f'D4 line {lineno}: SALES footer count/amount mismatch')
+                footer_positions[key] = len(current['details'])
+                footer_checks[key] = footer_checks.get(key, 0) + 1
+                continue
+            match = _FIRST.match(line)
+            if match:
+                if current is None:
+                    raise ValueError(f'D4 line {lineno}: transaction without bank/period')
+                date, time, code, kind, card, amount, fee, auth, trace = match.groups()
+                detail = dict(zip(DETAIL_FIELDS[:9], (
+                    datetime.strptime(date, '%d/%m/%y').date(),
+                    datetime.strptime(time, '%H:%M:%S').time(), code, kind, card,
+                    Decimal(amount.replace(',', '')), Decimal(fee.replace(',', '')), auth, trace,
+                )))
+                pending = (lineno, detail)
+            elif re.match(r'^\s*\d+\s+\d{2}/\d{2}/\d{2}\b', line):
+                raise ValueError(f'D4 line {lineno}: malformed transaction')
+        if pending is not None:
+            raise ValueError(f'D4 line {pending[0]}: incomplete transaction at end of file')
+        if not groups:
+            raise ValueError('D4 report contains no bank/period sections')
+        for group in groups.values():
+            group['frekuensi'] = len(group['details'])
+            group['totalamount'] = sum((row['transactionamount'] for row in group['details']), Decimal('0.00'))
+        missing = [{'acquirer': key[0], 'period': key[1].isoformat()}
+                for key, group in groups.items()
+                if key not in footer_checks or footer_positions[key] != len(group['details'])]
+        return {'issuername': issuer, 'groups': list(groups.values()),
+                'controls': {'validated_footers': sum(footer_checks.values()),
+                            'banks_without_complete_footer': missing}}
+
+    def persist_d4(connection, item, report, run_id):
+        try:
+            if item.get('expected') is not None:
+                reconcile_report(report, item['expected'])
+            checksum = item['d4_integrity']['sha256']
+            if not re.fullmatch(r'[0-9a-f]{64}', checksum):
+                raise ValueError('Missing verified D4 checksum')
+            with connection.cursor() as cursor:
+                cursor.execute('SELECT pg_advisory_xact_lock(hashtext(%s))', (item['filename'].lower(),))
+                cursor.execute(
+                    'SELECT fileid, contentsha256, fileversion FROM sw_rekon.acqpwc_file_log_tt '
+                    "WHERE lower(filename) = lower(%s) AND transactiontype = 'D4' AND isactive FOR UPDATE",
+                    (item['filename'],))
+                existing = cursor.fetchone()
+                requestid = previous_id = None
+                version = 1
+                if existing:
+                    previous_id, previous_checksum, version = existing
+                    if previous_checksum == checksum:
+                        write_ingestion_audit(cursor, item, run_id, 'ALREADY_PROCESSED',
+                                            'database', fileid=previous_id)
+                        connection.commit()
+                        return {'filename': item['filename'], 'fileid': previous_id,
+                                'status': 'already_processed', 'version': version}
+                    if previous_checksum is None:
+                        raise ValueError('Existing file has no verified checksum; operator review required')
+                    cursor.execute(
+                        'SELECT requestid FROM sw_rekon.acqpwc_reprocess_request_tt '
+                        "WHERE lower(filename)=lower(%s) AND previoussha256=%s AND expectedsha256=%s "
+                        "AND status='APPROVED' FOR UPDATE",
+                        (item['filename'], previous_checksum, checksum))
+                    approval = cursor.fetchone()
+                    if not approval:
+                        raise ValueError('Changed content for existing filename requires an approved reprocess request')
+                    requestid = approval[0]
+                    cursor.execute('UPDATE sw_rekon.acqpwc_file_log_tt SET isactive=FALSE WHERE fileid=%s',
+                                (previous_id,))
+                    version += 1
+                filedate = re.match(r'(\d{6})', item['filename'])
+                if not filedate:
+                    raise ValueError('D4 filename must start with a six-digit file date')
+                cursor.execute(
+                    'INSERT INTO sw_rekon.acqpwc_file_log_tt '
+                    '(filepath, filename, transactiontype, insetby, issuername, filedate, '
+                    'contentsha256, fileversion, replacesfileid) '
+                    'VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING fileid',
+                    (item.get('source_path', ''), item['filename'], 'D4', 'dag_settlement_off-us',
+                    report['issuername'], filedate.group(1), checksum, version, previous_id))
+                fileid = cursor.fetchone()[0]
+                for group in report['groups']:
+                    cursor.execute(
+                        'INSERT INTO sw_rekon.acqpwc_d4summary_tt '
+                        '(fileid, institutionid, issuer, period, frekuensi, totalamount) '
+                        'VALUES (%s, %s, %s, %s, %s, %s) RETURNING summaryid',
+                        (fileid, group['institutionid'], group['issuer'], group['period'],
+                        group['frekuensi'], group['totalamount']))
+                    summaryid = cursor.fetchone()[0]
+                    if group['details']:
+                        cursor.executemany(
+                            'INSERT INTO sw_rekon.acqpwc_d4detail_tt (summaryid, '
+                            + ', '.join(DETAIL_FIELDS) + ') VALUES ('
+                            + ', '.join(['%s'] * (len(DETAIL_FIELDS) + 1)) + ')',
+                            [(summaryid, *(row[field] for field in DETAIL_FIELDS)) for row in group['details']])
+                if requestid is not None:
+                    cursor.execute(
+                        "UPDATE sw_rekon.acqpwc_reprocess_request_tt SET status='APPLIED', "
+                        'appliedat=CURRENT_TIMESTAMP, oldfileid=%s, newfileid=%s WHERE requestid=%s',
+                        (previous_id, fileid, requestid))
+                write_ingestion_audit(cursor, item, run_id, 'LOADED', 'database',
+                                    {'version': version, 'reprocess_request_id': requestid,
+                                    'report_controls': report.get('controls')}, fileid)
+            connection.commit()
+            return {'filename': item['filename'], 'fileid': fileid, 'status': 'inserted',
+                    'version': version, 'summaries': len(report['groups']),
+                    'details': sum(group['frekuensi'] for group in report['groups'])}
+        except Exception:
+            connection.rollback()
+            raise
+
 
     def _hook(connection_type, connection_id):
         if connection_type == "FTP":
@@ -728,12 +721,16 @@ def dag_settlement_off_us():
                     item['zip_s3_url'], folder, item['zip_integrity'])
                 validate_zip(local_zip)
                 results = []
+                file_date = datetime.now(tz).strftime('%y%m%d')
+                logging.info('TXT FILE DATE: %s; FILE MASK: %s', file_date, config['file_txt'])
                 with zipfile.ZipFile(local_zip) as archive:
                     members = [member for member in archive.infolist()
-                               if fnmatch.fnmatchcase(os.path.basename(member.filename).upper(),
-                                                     config['file_txt'].upper())]
+                               if not member.is_dir()
+                               and os.path.basename(member.filename).startswith(file_date)
+                               and fnmatch.fnmatchcase(os.path.basename(member.filename).upper(),
+                                                      config['file_txt'].upper())]
                     if not members:
-                        raise ValueError(f"No D4_NPG.TXT found in {item['filename']}")
+                        raise ValueError(f"No D4_NPG.TXT for date {file_date} found in {item['filename']}")
                     names = [os.path.basename(member.filename).upper() for member in members]
                     if len(names) != len(set(names)):
                         raise ValueError(f"Duplicate D4 basename in {item['filename']}")

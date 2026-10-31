@@ -3,14 +3,15 @@
 `dag_settlement_off_us.py` contains the DAG, D4 parser, and database persistence
 in one file. It uses Airflow 3 TaskFlow to download SFTP ZIPs matching
 `config['file_zip']`, archive them in S3, and extract only the configured D4 mask
-(case insensitive). Archive entries are streamed to local basenames rather than
+(case insensitive), with a separate today-prefix filter (YYMMDD, WIB) for TXT
+names as well as ZIP names. Archive entries are streamed to local basenames rather than
 extracting paths from the ZIP. Each D4 file is parsed in full before any database
 writes. XCom carries file locations and load counts, not transaction/card data.
 
 Configure the Airflow connections `SFTP_EBSP`, `s3-artefact`, and `db_rekon_uat`.
 The source directory remains `/mtiuat/toocbc/QRRecon/ClearingRintisQRIS/`.
-The existing manual schedule is retained. The ZIP mask is `{date}NPG_RPT.zip`,
-where `{date}` is today at task execution in the DAG timezone (UTC+7/WIB),
+The existing manual schedule is retained. The ZIP mask is `*NPG_RPT.zip`. A separate filter requires the filename
+to start with today at task execution in the DAG timezone (UTC+7/WIB),
 formatted YYMMDD. It does not use the logical date of a historical run.
 For example, 31 October 2026 matches `261031NPG_RPT.zip`; the original
 `311030NPG_RPT.zip` test archive does not match this date filter.

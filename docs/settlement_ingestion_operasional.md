@@ -5,6 +5,9 @@
 Pengirim saat ini hanya menyediakan ZIP. Karena itu
 `require_sender_manifest=False` menjadi default dan tidak ada kewajiban file
 `.done` atau manifest pendamping. DAG mengambil ZIP hari ini (`YYMMDD`, WIB).
+TXT di dalam ZIP juga harus diawali tanggal hari ini dan cocok dengan wildcard
+`*D4_NPG.txt`. Member bertanggal lain dilewati; bila tidak ada TXT hari ini,
+ZIP ditolak ke karantina.
 
 Kesiapan file diperiksa dengan dua snapshot ukuran/mtime yang berselang
 `source_stability_seconds=5`. Untuk SFTP, file juga harus sudah berumur minimal
