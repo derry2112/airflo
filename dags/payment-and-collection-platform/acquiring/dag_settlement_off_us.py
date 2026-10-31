@@ -58,17 +58,6 @@ class GenericSFTPHook:
             self.conn = None
 
 db_rekon = PostgresEtlHook()
-DETAIL_FIELDS = (
-    'transactiondate', 'transactiontime', 'transactioncode', 'transactiontype',
-    'cardno', 'transactionamount', 'interchangefee', 'authcode', 'traceno',
-    'refno', 'termid', 'merchantid', 'merchantname',
-)
-_FIRST = re.compile(
-    r'^\s*\d+\s+(\d{2}/\d{2}/\d{2})\s+(\d{2}:\d{2}:\d{2})\s+'
-    r'(\d+)\s+(\d+)\s+(\d+)\s+([\d,]+\.\d{2})\s+'
-    r'([\d,]+\.\d{2})\s+(\S+)\s+(\S+)\s*$'
-)
-_SECOND = re.compile(r'^\s*(\d+)\s+(\S+)\s+(\d+-\d+)\s+(.+?)\s*$')
 config = {
     'workflow_name': 'dag_settlement_off-us',
     "owner": Owner.PAYMENT_AND_COLLECTION_PLATFORM,
@@ -93,6 +82,18 @@ config = {
 
     'file_zip': '*NPG_RPT.zip',
     'file_txt': '*D4_NPG.txt',
+
+    'detail_fields': (
+        'transactiondate', 'transactiontime', 'transactioncode', 'transactiontype',
+        'cardno', 'transactionamount', 'interchangefee', 'authcode', 'traceno',
+        'refno', 'termid', 'merchantid', 'merchantname',
+    ),
+    'first_line_pattern': (
+        r'^\s*\d+\s+(\d{2}/\d{2}/\d{2})\s+(\d{2}:\d{2}:\d{2})\s+'
+        r'(\d+)\s+(\d+)\s+(\d+)\s+([\d,]+\.\d{2})\s+'
+        r'([\d,]+\.\d{2})\s+(\S+)\s+(\S+)\s*$'
+    ),
+    'second_line_pattern': r'^\s*(\d+)\s+(\S+)\s+(\d+-\d+)\s+(.+?)\s*$',
 
     'input_s3_app': 'settlement_off-us',
     'result_s3_app_rintis': 'settlement_off-us',
@@ -365,6 +366,9 @@ def dag_settlement_off_us():
 
 
     def parse_d4(lines):
+        detail_fields = config['detail_fields']
+        first_line = re.compile(config['first_line_pattern'])
+        second_line = re.compile(config['second_line_pattern'])
         groups = {}
         footer_positions = {}
         footer_checks = {}
@@ -375,10 +379,10 @@ def dag_settlement_off_us():
                 raise ValueError(f'D4 line {lineno}: unexpected NUL byte')
             line = line.rstrip('\r\n\f')
             if pending is not None:
-                match = _SECOND.match(line)
+                match = second_line.match(line)
                 if not match:
                     raise ValueError(f'D4 line {lineno}: missing continuation for transaction at line {pending[0]}')
-                pending[1].update(zip(DETAIL_FIELDS[9:], match.groups()))
+                pending[1].update(zip(detail_fields[9:], match.groups()))
                 current['details'].append(pending[1])
                 pending = None
                 continue
@@ -413,12 +417,12 @@ def dag_settlement_off_us():
                 footer_positions[key] = len(current['details'])
                 footer_checks[key] = footer_checks.get(key, 0) + 1
                 continue
-            match = _FIRST.match(line)
+            match = first_line.match(line)
             if match:
                 if current is None:
                     raise ValueError(f'D4 line {lineno}: transaction without bank/period')
                 date, time, code, kind, card, amount, fee, auth, trace = match.groups()
-                detail = dict(zip(DETAIL_FIELDS[:9], (
+                detail = dict(zip(detail_fields[:9], (
                     datetime.strptime(date, '%d/%m/%y').date(),
                     datetime.strptime(time, '%H:%M:%S').time(), code, kind, card,
                     Decimal(amount.replace(',', '')), Decimal(fee.replace(',', '')), auth, trace,
@@ -441,6 +445,7 @@ def dag_settlement_off_us():
                             'banks_without_complete_footer': missing}}
 
     def persist_d4(connection, item, report, run_id):
+        detail_fields = config['detail_fields']
         try:
             if item.get('expected') is not None:
                 reconcile_report(report, item['expected'])
@@ -500,9 +505,9 @@ def dag_settlement_off_us():
                     if group['details']:
                         cursor.executemany(
                             'INSERT INTO sw_rekon.acqpwc_d4detail_tt (summaryid, '
-                            + ', '.join(DETAIL_FIELDS) + ') VALUES ('
-                            + ', '.join(['%s'] * (len(DETAIL_FIELDS) + 1)) + ')',
-                            [(summaryid, *(row[field] for field in DETAIL_FIELDS)) for row in group['details']])
+                            + ', '.join(detail_fields) + ') VALUES ('
+                            + ', '.join(['%s'] * (len(detail_fields) + 1)) + ')',
+                            [(summaryid, *(row[field] for field in detail_fields)) for row in group['details']])
                 if requestid is not None:
                     cursor.execute(
                         "UPDATE sw_rekon.acqpwc_reprocess_request_tt SET status='APPLIED', "

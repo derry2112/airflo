@@ -31,16 +31,28 @@ names = {'DETAIL_FIELDS', '_FIRST', '_SECOND', 'parse_d4', 'persist_d4',
          'validate_zip', 'extract_verified_member', 'retry_transfer', 'process_isolated',
          'is_transient_transfer_error', 'select_ready_archives', 'validate_sender_manifest',
          'reconcile_report', 'write_ingestion_audit', 'source_is_stable'}
-nodes = [node for node in tree.body if (
-    isinstance(node, ast.FunctionDef) and node.name in names
-) or (
-    isinstance(node, ast.Assign)
-    and any(isinstance(target, ast.Name) and target.id in names for target in node.targets)
-)]
+nodes = []
+for node in ast.walk(tree):
+    if isinstance(node, ast.FunctionDef) and node.name in names:
+        node = deepcopy(node)
+        node.decorator_list = []
+        nodes.append(node)
+config_node = next(node for node in tree.body if isinstance(node, ast.Assign)
+                   and any(isinstance(target, ast.Name) and target.id == 'config' for target in node.targets))
+parser_config = {ast.literal_eval(key): ast.literal_eval(value)
+                 for key, value in zip(config_node.value.keys, config_node.value.values)
+                 if isinstance(key, ast.Constant) and key.value in
+                 {'detail_fields', 'first_line_pattern', 'second_line_pattern'}}
 d4 = ModuleType('dag_settlement_off_us')
 d4.__dict__.update(re=re, datetime=datetime, Decimal=Decimal, hashlib=hashlib,
-                   zipfile=zipfile, os=os, shutil=shutil, Path=Path, logging=logging, time=time, json=json, fnmatch=fnmatch)
+                   zipfile=zipfile, os=os, shutil=shutil, Path=Path, logging=logging,
+                   time=time, json=json, fnmatch=fnmatch, config=parser_config)
 exec(compile(ast.Module(body=nodes, type_ignores=[]), str(DAG_PATH), 'exec'), d4.__dict__)
+
+class FrozenDateTime(datetime):
+    @classmethod
+    def now(cls, tz=None):
+        return cls(2026, 10, 31, 12, tzinfo=tz)
 
 HEADER = '''ACQUIRER: BC-BANK CENTRAL ASIA
 TANGGAL : 25-09-23
@@ -193,7 +205,8 @@ class RecoveryTests(unittest.TestCase):
                          TemporaryDirectory=TemporaryDirectory, List=List,
                          workflow_name='test', dag_name='test',
                          get_current_context=lambda: {'dag_run': type('Run', (), {'run_id': 'test'})()},
-                         config={'source_path': '/inbound/', 'file_txt': '*D4_NPG.txt',
+                         datetime=FrozenDateTime, tz=timezone.utc,
+                         config={**parser_config, 'source_path': '/inbound/', 'file_txt': '*D4_NPG.txt',
                                  'result_s3_app_rintis': 'test', 'txt_encoding': 'utf-8-sig', 'db_rekon': 'test'})
         outer = next(node for node in tree.body
                      if isinstance(node, ast.FunctionDef) and node.name == 'dag_settlement_off_us')
@@ -219,17 +232,17 @@ class RecoveryTests(unittest.TestCase):
         namespace['persist_d4'] = persist
         buffer = io.BytesIO()
         with zipfile.ZipFile(buffer, 'w') as archive:
-            archive.writestr('251030D4_NPG.txt', HEADER + TRANSACTION)
-            archive.writestr('251031D4_NPG.txt', HEADER + TRANSACTION.splitlines()[0] + '\n')
+            archive.writestr('261031D4_NPG.txt', HEADER + TRANSACTION)
+            archive.writestr('261031BAD_D4_NPG.txt', HEADER + TRANSACTION.splitlines()[0] + '\n')
         payload = buffer.getvalue()
         storage['s3://test/input.zip'] = payload
         extracted = namespace['extract_d4_files']([{
             'filename': 'input.zip', 'zip_s3_url': 's3://test/input.zip',
             'zip_integrity': d4.fingerprint_stream(io.BytesIO(payload)),
             'manifest': sender_manifest(payload, [
-                expected_entry((HEADER + TRANSACTION).encode()),
+                expected_entry((HEADER + TRANSACTION).encode(), '261031D4_NPG.txt'),
                 expected_entry((HEADER + TRANSACTION.splitlines()[0] + '\n').encode(),
-                               '251031D4_NPG.txt', d4.parse_d4((HEADER + TRANSACTION).splitlines()))])}])
+                               '261031BAD_D4_NPG.txt', d4.parse_d4((HEADER + TRANSACTION).splitlines()))])}])
         result = namespace['load_d4_files'](extracted)
         self.assertEqual([item['status'] for item in result], ['inserted', 'quarantined'])
         self.assertEqual(persist.call_count, 1)

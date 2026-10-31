@@ -38,12 +38,17 @@ def main():
             connection.commit()
         path = root / 'payment-and-collection-platform/acquiring/dag_settlement_off_us.py'
         tree = ast.parse(path.read_text().replace('sw_rekon', schema))
-        nodes = [node for node in tree.body
-                 if (isinstance(node, ast.FunctionDef) and node.name != 'dag_settlement_off_us')
-                 or (isinstance(node, ast.Assign) and any(
-                     isinstance(target, ast.Name) and target.id in {'DETAIL_FIELDS', '_FIRST', '_SECOND'}
-                     for target in node.targets))]
-        namespace = dict(globals())
+        names = {'parse_d4', 'persist_d4', 'write_ingestion_audit', 'reconcile_report'}
+        nodes = [node for node in ast.walk(tree)
+                 if isinstance(node, ast.FunctionDef) and node.name in names]
+        config_node = next(node for node in tree.body if isinstance(node, ast.Assign)
+                           and any(isinstance(target, ast.Name) and target.id == 'config'
+                                   for target in node.targets))
+        parser_config = {ast.literal_eval(key): ast.literal_eval(value)
+                         for key, value in zip(config_node.value.keys, config_node.value.values)
+                         if isinstance(key, ast.Constant) and key.value in
+                         {'detail_fields', 'first_line_pattern', 'second_line_pattern'}}
+        namespace = dict(globals(), config=parser_config)
         exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), 'exec'), namespace)
         parse, persist = namespace['parse_d4'], namespace['persist_d4']
         text = ('ACQUIRER: BC-BANK CENTRAL ASIA\nTANGGAL : 25-09-23\n'
