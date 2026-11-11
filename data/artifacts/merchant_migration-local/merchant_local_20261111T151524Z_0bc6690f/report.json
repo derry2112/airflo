@@ -1,0 +1,17 @@
+{
+  "run_id": "merchant_local_20261111T151524Z_0bc6690f",
+  "status": "failed",
+  "scope": "Actual task callables and local SFTP/S3 services; not an Airflow scheduled/test DagRun",
+  "ssh_executed": false,
+  "powercard_import_tested": false,
+  "database": "not_executed",
+  "tasks": {},
+  "active_task_ids": [
+    "delete_files_source",
+    "get_files_from_server_sftp",
+    "get_files_to_process",
+    "put_files_to_server_bo",
+    "update_merchant_to_db"
+  ],
+  "error_type": "OSError"
+}
